@@ -1,39 +1,59 @@
 import torch
 import torch.nn.functional as F
-from typing import Tuple
-from dkrc.utils.matrix_utils import compute_controllability_matrix
+from typing import Tuple, List
+from rdkrc.utils.matrix_utils import compute_controllability_matrix
 
 
 def compute_L1_loss(
-    z_prev: torch.Tensor,
-    z_next: torch.Tensor
+    z_prev_batch: torch.Tensor,  # 原文Batch版z(x_t)：[N, BatchSize]，每列=单个z_prev_i（[N,1]）
+    z_next_batch: torch.Tensor   # 原文Batch版z(x_{t+1})：[N, BatchSize]，每列=单个z_next_i（[N,1]）
 ) -> torch.Tensor:
     """
-    计算L1损失:保证Koopman线性化精度(原文Equation 7中L1部分)
-    L1 = (1/(L-1)) * Σ||z(x_{t+1}) - K·z(x_t)||,其中K = z(x_{t+1})·z(x_t)^†(伪逆)
+    分离Batch中每个z的L1损失计算（完全基于原文）
+    逻辑：对Batch中每个样本的z_prev_i、z_next_i单独计算，再汇总损失
+    对应原文Algorithm 1步骤2：L1(θ) = (1/(L-1))·Σ||z(x_{t+1}) - K·z(x_t)||，K=z(x_{t+1})·z(x_t)^†
     
     Args:
-        z_prev (torch.Tensor): t时刻线性化状态z(x_t),形状[batch_size, N]
-        z_next (torch.Tensor): t+1时刻线性化状态z(x_{t+1}),形状[batch_size, N]
+        z_prev_batch: 原文Batch线性化状态z(x_t)，维度[N, BatchSize]（N=基函数维度，如128）
+        z_next_batch: 原文Batch线性化状态z(x_{t+1})，维度[N, BatchSize]
     
     Returns:
-        torch.Tensor: L1损失值(标量)
+        total_L1: Batch总L1损失（标量，对应原文求和后平均）
+        single_K_list: 每个样本的Koopman算子K_i列表（每个元素[N,N]，对应原文单样本K）
+        single_error_list: 每个样本的线性误差列表（每个元素[N,1]，对应原文单样本误差）
     """
-    # 计算K = z_next @ z_prev.T @ (z_prev @ z_prev.T)^†(Koopman算子近似)
-    z_prev_T = z_prev.T  # [N, batch_size]
-    gram_matrix = z_prev @ z_prev_T  # [N, N]
-    gram_matrix_pinv = torch.pinverse(gram_matrix)  # [N, N],伪逆
-    K = z_next @ z_prev_T @ gram_matrix_pinv  # [batch_size, N] → 实际应为[N, N],需调整维度
-    
-    # 修正K的维度:批量平均后得到[N, N]的K(原文中K是全局算子,非批量依赖)
-    K = K.mean(dim=0).reshape(z_prev.shape[1], z_prev.shape[1])  # [N, N]
-    
-    # 计算线性化误差:z_next - K·z_prev
-    linear_error = z_next - z_prev @ K.T  # [batch_size, N]
-    # 计算F范数(批量内平均)
-    L1 = torch.norm(linear_error, p='fro', dim=1).mean()
-    
-    return L1
+    BatchSize = z_prev_batch.shape[1]  # Batch样本数（如64）
+    L1_sum = torch.tensor(0.0)  # 初始化总L1损失
+
+    # -------------------------- 步骤1：分离Batch，逐个处理每个样本的z --------------------------
+    for i in range(BatchSize):
+        # 1.1 提取单个样本的z（严格匹配原文单样本z维度[N,1]）
+        z_prev_i = z_prev_batch[:, i].unsqueeze(1)  # 第i个样本的z(x_t)：[N,1]
+        z_next_i = z_next_batch[:, i].unsqueeze(1)  # 第i个样本的z(x_{t+1})：[N,1]
+        # 1.2 单样本计算Koopman算子K_i（原文K=z(x_{t+1})·z(x_t)^†）
+        # 原文单样本Gram矩阵：z_prev_i · z_prev_i^T → [N,1] @ [1,N] = [N,N]（符合原文线性算子近似需求）
+        z_prev_i_T = z_prev_i.T  # [1,N]
+        gram_matrix_i = z_prev_i @ z_prev_i_T  # [N,N]
+        # 单样本伪逆（原文公式8中A/B更新用伪逆，此处完全复用逻辑）
+        gram_matrix_pinv_i = torch.pinverse(gram_matrix_i)  # [N,N]
+        # 单样本K_i：K_i = z_next_i · z_prev_i^T · gram_matrix_pinv_i → 维度链[N,1]@[1,N]@[N,N] = [N,N]
+        K_i = (z_next_i @ z_prev_i_T) @ gram_matrix_pinv_i  # 严格匹配原文K定义
+
+        # 1.3 单样本计算线性误差（原文误差项||z(x_{t+1}) - K·z(x_t)||）
+        # 单样本线性预测：K_i · z_prev_i → [N,N] @ [N,1] = [N,1]（匹配z_next_i维度）
+        linear_pred_i = K_i @ z_prev_i
+        # 单样本误差：z_next_i - linear_pred_i → [N,1]
+        error_i = z_next_i - linear_pred_i
+
+        # 1.4 单样本计算L1误差（原文||·||：F范数）
+        l1_i = torch.norm(error_i, p='fro')  # 标量，单样本误差范数
+        L1_sum += l1_i  # 累加到总L1损失
+
+    # -------------------------- 步骤2：汇总Batch损失（符合原文求和平均逻辑） --------------------------
+    # 原文L1(θ)是对时间序列L个样本求和后除以L-1, L= BatchSize
+    total_L1 = L1_sum / (BatchSize - 1)  # 标量，Batch总L1损失
+
+    return total_L1
 
 
 def compute_L2_loss(
