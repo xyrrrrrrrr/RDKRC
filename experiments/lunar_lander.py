@@ -223,7 +223,7 @@ if __name__ == "__main__":
         num_episodes=10,  # 文档指定5次，对应1876组数据
         noise_scale=0.1  # 文档IV.D节指定噪声强度
     )
-
+     
     # 步骤2：训练PsiMLP网络（文档II.28节+Algorithm 1）
     print("\n" + "="*50 + " 步骤2/3：训练PsiMLP网络（文档Algorithm 1） " + "="*50)
     psi_lander, A_lander, B_lander, C_lander = train_psi_lander(
