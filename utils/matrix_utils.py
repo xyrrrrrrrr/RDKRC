@@ -5,6 +5,10 @@ from typing import Tuple
 import torch
 from typing import Tuple, List
 
+import torch
+from typing import Tuple, List
+
+
 def update_A_B(
     z_prev: torch.Tensor,
     z_next: torch.Tensor,
@@ -14,74 +18,74 @@ def update_A_B(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     基于《Deep Learning of Koopman Representation for Control.pdf》Equation 8，
-    适配`z_prev=[batch_size, N]`输入维度，对每个样本单独计算A_i、B_i后取平均。
+    适配`z_prev=[batch_size, N]`维度，A、B采用**全局同除数归一化**，保留数值计算关系。
     
-    原文公式：[A, B] = z_{t+1} · [z_t; U] · ([z_t U] · [z_t; U]^T)^†
-    适配逻辑：
-    1. 按`[batch_size, N]`维度拆分单样本，转换为原文单样本所需的`[N, 1]`；
-    2. 每个样本独立执行原文公式计算A_i、B_i；
-    3. 所有样本的A_i、B_i分别取平均，保持原文“批量数据驱动Koopman算子近似”的核心目标。
+    文档依据：
+    - Equation 8：[A,B] = z_{t+1}·[z_t;U]·([z_t U]·[z_t;U]^T)^†（A、B协同构成线性模型）
+    - Section II.20：高维线性模型 z_{t+1}=A z_t + B v_t（A、B需保持数值比例以确保模型一致性）
+    - Section II.27：批量数据提升Koopman算子近似稳定性（归一化需避免破坏批量平均结果）
     
     Args:
-        z_prev: t时刻线性化状态（原文公式4的z(x_t)），形状[batch_size, N]（如64, 128）；
-        z_next: t+1时刻线性化状态（原文公式4的z(x_{t+1})），形状[batch_size, N]（如64, 128）；
-        u_prev: t时刻控制输入（原文公式1的u_t），形状[batch_size, m]（m为控制维度，如64, 1）。
-        A_init: 初始化的Koopman矩阵A（未使用，仅为接口统一保留）；
-        B_init: 初始化的控制矩阵B（未使用，仅为接口统一保留）。
+        z_prev: t时刻线性化状态（Equation 4的z(x_t)），形状[batch_size, N]；
+        z_next: t+1时刻线性化状态（Equation 4的z(x_{t+1})），形状[batch_size, N]；
+        u_prev: t时刻控制输入（Equation 1的u_t），形状[batch_size, m]；
+        A_init: 历史Koopman矩阵（用于平滑更新，Section II.28训练稳定性要求）；
+        B_init: 历史控制矩阵（用于平滑更新，Section II.28训练稳定性要求）。
     
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            A: 批量样本A_i的平均（原文定义的Koopman矩阵），形状[N, N]（如128, 128）；
-            B: 批量样本B_i的平均（原文定义的控制矩阵），形状[N, m]（如128, 1）。
+        A: 归一化后Koopman矩阵（同除数），形状[N, N]；
+        B: 归一化后控制矩阵（同除数），形状[N, m]。
     """
-    # 1. 提取核心维度（基于输入形状与原文定义）
-    batch_size = z_prev.shape[0]  # 批量样本数（原文Section II.27批量训练逻辑）
-    N = z_prev.shape[1]           # 基函数维度（原文Section II.25，N≫n，n为原始状态维度）
-    m = u_prev.shape[1]           # 控制维度（原文Section IV.C倒立摆m=1，IV.D月球着陆器m=2）
+    # 1. 提取核心维度（匹配文档Section II.25：N≫n，m为控制维度）
+    batch_size = z_prev.shape[0]
+    N = z_prev.shape[1]  # 基函数维度（高维空间维度）
+    m = u_prev.shape[1]  # 控制维度（倒立摆m=1，月球着陆器m=2，🔶1-69、🔶1-80）
 
-    # 2. 初始化单样本A_i、B_i存储列表
+    # 2. 初始化单样本A_i、B_i存储（文档Equation 8单样本计算逻辑）
     single_A_list: List[torch.Tensor] = []
     single_B_list: List[torch.Tensor] = []
 
-    # 3. 拆分batch，每个样本独立计算A_i、B_i（严格遵循原文Equation 8）
+    # 3. 单样本计算A_i、B_i（严格遵循Equation 8）
     for i in range(batch_size):
-        # 3.1 提取单样本并转换为原文单样本维度
-        # 原文单样本z(x_t)为[N, 1]（N维列向量，Section II.35），需将[1, N]的行向量转置为[N, 1]
-        z_prev_i = z_prev[i, :].unsqueeze(1)  # 从[batch_size, N]取第i行→[1, N]→转置为[N, 1]
-        z_next_i = z_next[i, :].unsqueeze(1)  # 同理，单样本z(x_{t+1})→[N, 1]
-        u_prev_i = u_prev[i, :].unsqueeze(1)  # 单样本控制输入→[m, 1]（匹配原文U的单样本维度）
+        # 3.1 转换为文档单样本维度：[N,1]（列向量，Section II.35定义）
+        z_prev_i = z_prev[i, :].unsqueeze(1)  # [N,1]
+        z_next_i = z_next[i, :].unsqueeze(1)  # [N,1]
+        u_prev_i = u_prev[i, :].unsqueeze(1)  # [m,1]
 
-        # 3.2 构建原文Equation 8的[z_t; U]（纵向拼接，dim=0）[N+m, 1]（如128+1=129, 1）
-        X_i = torch.cat([z_prev_i, u_prev_i], dim=0)  # 严格匹配原文“[z_t; U]”的结构
-        # 3.3 计算原文Gram矩阵及其伪逆（Equation 8的([z_t U]·[z_t; U]^T)^†）
+        # 3.2 构建Equation 8的[z_t; U]（纵向拼接，dim=0）
+        X_i = torch.cat([z_prev_i, u_prev_i], dim=0)  # [N+m, 1]
+        # 3.3 计算Gram矩阵及其伪逆（Equation 8必需步骤）
         X_i_T = X_i.T  # [1, N+m]
-        gram_matrix_i = X_i @ X_i_T  # 结果为[N+m, N+m]（符合原文维度）
-        gram_matrix_pinv_i = torch.pinverse(gram_matrix_i)  # 伪逆，形状[N+m, N+m]
+        gram_matrix_i = X_i @ X_i_T  # [N+m, N+m]
+        gram_matrix_pinv_i = torch.pinverse(gram_matrix_i)  # 伪逆处理不可逆情况
 
-        # 3.4 单样本计算[A_i, B_i]（完全遵循原文Equation 8）
-        AB_temp_i = z_next_i @ X_i_T @ gram_matrix_pinv_i  # 维度链[N,1]@[1,N+m]@[N+m,N+m] = [N, N+m]
+        # 3.4 单样本求解[A_i, B_i]（Equation 8核心计算）
+        AB_temp_i = z_next_i @ X_i_T @ gram_matrix_pinv_i  # [N, N+m]
+        # 3.5 分割A_i（前N列）、B_i（后m列），匹配文档维度定义
+        A_i = AB_temp_i[:, :N]  # [N, N]
+        B_i = AB_temp_i[:, N:]  # [N, m]
 
-        # 3.5 分割单样本A_i、B_i（原文Equation 8中[A,B]前N列为A，后m列为B）
-        A_i = AB_temp_i[:, :N]  # 取前N列→[N, N]（原文Koopman矩阵定义）
-        B_i = AB_temp_i[:, N:]  # 取后m列→[N, m]（原文控制矩阵定义）
-
-        # 3.6 收集单样本结果
         single_A_list.append(A_i)
         single_B_list.append(B_i)
 
-    # 4. 批量平均（原文Section II.27：批量数据提升Koopman算子近似稳定性）
-    # 将所有样本的A_i、B_i分别堆叠后按样本维度（dim=0）取平均
-    A = torch.stack(single_A_list).mean(dim=0)  # [batch_size, N, N]→[N, N]
-    B = torch.stack(single_B_list).mean(dim=0)  # [batch_size, N, m]→[N, m]
+    # 4. 批量平均（Section II.27：批量数据降低噪声，提升近似稳定性）
+    A_avg = torch.stack(single_A_list).mean(dim=0)  # [N, N]
+    B_avg = torch.stack(single_B_list).mean(dim=0)  # [N, m]
 
-    A_col_norm = torch.norm(A, dim=0, keepdim=True) + 1e-8  # [1, N]
-    A_normalized = A / A_col_norm  # 归一化后的A，数值规模可控
-    B_col_norm = torch.norm(B, dim=0, keepdim=True) + 1e-8  # [1, m]
-    B_normalized = B / B_col_norm  # 归一化后的B，
+    # 5. 同除数归一化（核心修改：A、B用同一全局范数，保留数值计算关系）
+    # 5.1 拼接A、B为整体矩阵（反映二者协同关系，Equation 5线性模型约束）
+    AB_avg = torch.cat([A_avg, B_avg], dim=1)  # [N, N+m]
+    # 5.2 计算全局单一范数（Frobenius范数，衡量AB整体尺度，避免列归一化破坏关系）
+    global_norm = torch.norm(AB_avg, p='fro') + 1e-8  # 单数值，加1e-8防除零
+    # 5.3 A、B除以同一范数，保留相对数值关系（符合Equation 5 z_{t+1}=A z_t + B v_t）
+    A_normalized = A_avg / global_norm
+    B_normalized = B_avg / global_norm
 
-    A = 0.5 * A_init.detach() + 0.5 * A_normalized  # 平滑更新，防止训练初期A剧烈波动
-    B = 0.5 * B_init.detach() + 0.5 * B_normalized  # 同上
-    
+    # 6. 平滑更新（Section II.28训练稳定性要求：避免A、B剧烈波动）
+    alpha = 0.1  # 当前计算值权重（文档未指定，取小值确保平滑）
+    A = (1 - alpha) * A_init.detach() + alpha * A_normalized
+    B = (1 - alpha) * B_init.detach() + alpha * B_normalized
+
     return A, B
 
 

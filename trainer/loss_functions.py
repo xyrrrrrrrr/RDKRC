@@ -58,9 +58,9 @@ def compute_L1_loss(
 def compute_L2_loss(
     A: torch.Tensor,
     B: torch.Tensor,
-    lambda_rank: float = 0.2,
-    lambda_A: float = 0.4,
-    lambda_B: float = 0.4
+    lambda_rank: float = 0.8,
+    lambda_A: float = 0.1,
+    lambda_B: float = 0.1
 ) -> torch.Tensor:
     """
     计算L2损失（文档Algorithm 1步骤3）：

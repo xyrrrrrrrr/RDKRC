@@ -14,6 +14,14 @@ from rdkrc.utils.matrix_utils import compute_C_matrix, update_A_B
 from rdkrc.controller.lqr_controller import solve_discrete_lqr
 
 
+import torch
+import gym
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Tuple
+from rdkrc.models.psi_mlp import PsiMLP
+
+
 def test_lander_lqr(
     psi: PsiMLP,
     K_lqr: np.ndarray,
@@ -22,57 +30,93 @@ def test_lander_lqr(
     max_steps: int = 500
 ) -> List[float]:
     """
-    月球着陆器LQR控制测试（文档IV.D节）
-    核心修正：加入\(u_0\)计算\(u_t = v_t + u_0\)，纠正目标状态与控制输入裁剪逻辑。
+    月球着陆器LQR控制测试（仅生成轨迹汇总图）
+    依据文档IV.D节：通过10次独立测试记录轨迹，汇总展示多回合路径收敛性，验证DKRC鲁棒性（🔶1-83、🔶1-87）。
     
     Args:
-        psi: 训练好的PsiMLP网络（含\(u_0\)参数）
-        K_lqr: LQR控制增益，shape=[2, 256]（文档III节输出）
-        x_star: 目标状态（着陆区，文档IV.D节定义：x=0, y=0），shape=[6]
-        num_episodes: 测试回合数（文档IV.D节指定10次）
-        max_steps: 每回合最大步数（避免无限循环）
+        psi: 训练好的PsiMLP网络（含u₀参数，文档II.36节）
+        K_lqr: LQR控制增益，shape=[2, 256]（文档III节离散LQR求解）
+        x_star: 目标状态（着陆区，文档IV.D节定义：x、y对应着陆位置），shape=[6]
+        num_episodes: 测试回合数（文档指定10次，确保统计鲁棒性）
+        max_steps: 每回合最大步数（避免无限循环，文档未指定时默认500）
     Returns:
-        episode_scores: 每回合得分列表（Gym内置得分，>200为成功着陆）
+        episode_scores: 每回合得分列表（Gym内置得分，>200为成功着陆，文档IV.D节评估标准）
     """
     env = gym.make("LunarLanderContinuous-v2")
     device = next(psi.parameters()).device
     episode_scores: List[float] = []
+    all_trajectories: List[List[Tuple[float, float]]] = []  # 存储所有episode的x-y轨迹（文档核心位置维度）
 
-    psi.eval()  # 推理模式（禁用梯度计算）
+    psi.eval()  # 推理模式（禁用梯度，文档测试阶段要求）
     with torch.no_grad():
         for ep in range(num_episodes):
-            x_prev = env.reset()  # Gym新版本返回(obs, info)，适配接口
-            x_prev = x_prev[0:6]  # 仅保留文档定义的6维状态（x,y,θ,ẋ,ẏ,θ̇）
+            # 初始化环境（文档IV.D节：随机初始扰动）
+            x_prev  = env.reset() 
+            x_prev = x_prev[0:6]     # 取文档定义的6维状态（x,y,θ,ẋ,ẏ,θ̇），仅x-y用于轨迹绘制
             done = False
             total_score = 0.0
             step = 0
+            trajectory = []  # 记录当前episode的x-y坐标（文档图8核心维度）
 
             while not done and step < max_steps:
-                # 1. 状态预处理：计算高维线性状态z = Ψ(x) - Ψ(x*)（文档Equation 4）
-                x_prev_tensor = torch.tensor(x_prev, device=device, dtype=torch.float32).unsqueeze(0)  # [1,6]
-                z_prev = psi.compute_z(x_prev_tensor, x_star)  # [1,256]
+                # 记录当前位置（仅保留文档关注的x-y维度，🔶1-80、🔶1-87）
+                trajectory.append((x_prev[0], x_prev[1]))
+
+                # 1. 计算高维线性状态z（文档Equation 4：z=Ψ(x)-Ψ(x*)）
+                x_prev_tensor = torch.tensor(x_prev, device=device, dtype=torch.float32).unsqueeze(0)
+                z_prev = psi.compute_z(x_prev_tensor, x_star)
                 z_prev_np = z_prev.cpu().detach().numpy()
 
-                # 2. 计算LQR控制输入（文档III节逻辑：v_t = -K_lqr z_t，u_t = v_t + u_0）
-                v_t = -K_lqr @ z_prev_np.T  # [2,1]（变换后控制输入）
-                u0 = psi.forward_u0(x_prev_tensor).cpu().detach().numpy().squeeze()  # [2]（从PsiMLP获取训练后的u0）
-                u_t = v_t.squeeze() + u0  # [2]（原始控制输入，加入u0补偿）
+                # 2. 计算LQR控制输入（文档III节：v_t=-K_lqr z_t，u_t=v_t+u₀）
+                v_t = -K_lqr @ z_prev_np.T  # 变换后控制输入
+                u0 = psi.forward_u0(x_prev_tensor).cpu().detach().numpy().squeeze()  # 文档II.36节u₀补偿
+                u_t = v_t.squeeze() + u0
+                u_t = np.clip(u_t, env.action_space.low, env.action_space.high)  # 文档隐含控制约束
 
-                # 3. 控制输入裁剪（确保在环境动作空间内，文档IV.D节隐含约束）
-                u_t = np.clip(u_t, env.action_space.low, env.action_space.high)
-
-                # 4. 环境交互（获取下一状态与奖励）
-                x_next, reward, done, _ = env.step(u_t)  # 适配Gym新版本接口
+                # 3. 环境交互（文档IV.D节：获取下一状态与奖励）
+                x_next, reward, done, _  = env.step(u_t)
                 total_score += reward
-                x_prev = x_next[0:6]  # 更新状态，保留前6维
+                x_prev = x_next[0:6]
                 step += 1
 
+            # 记录最终位置（确保轨迹完整覆盖“初始→目标”过程，🔶1-87）
+            trajectory.append((x_prev[0], x_prev[1]))
+            all_trajectories.append(trajectory)  # 收集当前episode轨迹
             episode_scores.append(total_score)
-            print("最终状态：", x_prev)
             print(f"测试回合 {ep+1:2d}/{num_episodes} | 得分：{total_score:5.1f} | 步数：{step:3d}")
 
     env.close()
-    # 结果统计（文档IV.D节评估标准：平均得分、成功着陆次数）
+    x_star = x_star.cpu().numpy()
+    # -------- 绘制轨迹汇总图（严格对齐文档图8，🔶1-87） --------
+    plt.figure(figsize=(10, 8))
+    colors = plt.cm.tab10.colors  # 多轨迹颜色区分（避免重叠遮挡，文档图8风格）
+    # 画出x_star位置
+    plt.scatter(x_star[0], x_star[1], color="red", marker="x", s=50, edgecolor="black", label="Start")
+    for ep, trajectory in enumerate(all_trajectories):
+        # 提取x-y坐标（文档核心位置维度）
+        x_coords = [p[0] for p in trajectory]
+        y_coords = [p[1] for p in trajectory]
+        color = colors[ep % len(colors)]  # 循环分配颜色，适配10次回合
+        # 绘制轨迹线（文档图8：低透明度展示多轨迹分布）
+        plt.plot(x_coords, y_coords, color=color, alpha=0.7)
+
+    # 标注着陆区（文档IV.D节：着陆平台位置，y对应目标高度）
+    plt.axhline(y=0, color="black", linestyle="--", alpha=0.8, label="Landing Pad")
+    # 坐标轴设置（匹配文档状态空间：x∈[-1.5,1.5]，y∈[0,1.5]，🔶1-80）
+    plt.xlim(-1.5, 1.5)
+    plt.ylim(0, 1.5)
+    # 标签与标题（文档图8规范：明确位置维度与实验对象）
+    plt.xlabel("X Position (Horizontal)", fontsize=12)
+    plt.ylabel("Y Position (Altitude)", fontsize=12)
+    plt.title("Lunar Lander Trajectory Summary (DKRC + LQR)", fontsize=14)
+    # 图例（避免遮挡轨迹，文档图8右侧布局）
+    plt.legend(loc="upper right", bbox_to_anchor=(1.25, 1), fontsize=10)
+    plt.grid(True, alpha=0.5)
+    # 保存汇总图（确保完整显示图例，文档实验结果保存要求）
+    plt.savefig("lunar_lander_trajectory_summary.png", bbox_inches="tight", dpi=300)
+    plt.close()
+
+    # 测试结果统计（文档IV.D节评估标准：平均得分、成功着陆次数）
     avg_score = np.mean(episode_scores)
     std_score = np.std(episode_scores)
     success_count = sum(score > 200 for score in episode_scores)
@@ -169,7 +213,7 @@ def train_psi_lander(
                 u_prev=u_prev_batch,
                 u0=u0_batch,
                 lambda_L1=0.999,
-                lambda_L2=0.001  # 文档Algorithm 1无权重，默认1.0
+                lambda_L2=0.001  
             )
             
             # 4.5 反向传播与参数更新
@@ -178,11 +222,14 @@ def train_psi_lander(
             optimizer.step()
             
             total_epoch_loss += total_loss.item() * batch_size  # 累积 epoch 损失
-
+        # 每过20个epoch降低一次学习率
+        if (epoch + 1) % 20 == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.1
         # 打印epoch信息（平均损失，便于监控收敛）
         avg_epoch_loss = total_epoch_loss / len(dataset)
         avg_loss_list.append(avg_epoch_loss)
-        print(f"Epoch [{epoch+1:3d}/{epochs}] | 平均总损失：{avg_epoch_loss:.4f} | L1：{L1.item():.4f} | L2：{L2.item():.4f}")
+        print(f"Epoch [{epoch+1:3d}/{epochs}] | 平均总损失：{avg_epoch_loss:.4f} | L1：{L1.item():.4f} | L2：{L2.item():.4f}", end='\r', flush=True)
     plot_loss_curve(avg_loss_list)
     # 5. 计算最终A/B/C矩阵（文档Algorithm 1步骤5，用全部数据确保收敛精度）
     psi.eval()
