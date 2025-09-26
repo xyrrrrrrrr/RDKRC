@@ -8,18 +8,10 @@ import matplotlib.pyplot as plt
 from typing import Tuple, List
 from torch.utils.data import TensorDataset, DataLoader
 from rdkrc.utils.data_utils import generate_lunar_lander_data
-from rdkrc.models.psi_mlp import PsiMLP
+from rdkrc.models.psi_mlp import PsiMLP, PsiMLP_v2
 from rdkrc.trainer.loss_functions import compute_total_loss
 from rdkrc.utils.matrix_utils import compute_C_matrix, update_A_B
-from rdkrc.controller.lqr_controller import solve_discrete_lqr
-
-
-import torch
-import gym
-import numpy as np
-import matplotlib.pyplot as plt
-from typing import List, Tuple
-from rdkrc.models.psi_mlp import PsiMLP
+from rdkrc.controller.lqr_controller import solve_discrete_lqr, solve_discrete_lqr_v2
 
 
 def test_lander_lqr(
@@ -27,7 +19,8 @@ def test_lander_lqr(
     K_lqr: np.ndarray,
     x_star: torch.Tensor,
     num_episodes: int = 10,
-    max_steps: int = 500
+    max_steps: int = 500,
+    version: str = "v1"
 ) -> List[float]:
     """
     月球着陆器LQR控制测试（仅生成轨迹汇总图）
@@ -39,6 +32,7 @@ def test_lander_lqr(
         x_star: 目标状态（着陆区，文档IV.D节定义：x、y对应着陆位置），shape=[6]
         num_episodes: 测试回合数（文档指定10次，确保统计鲁棒性）
         max_steps: 每回合最大步数（避免无限循环，文档未指定时默认500）
+        version: PsiMLP版本选择（"v1"为基础版，"v2"为改进版，默认"v1"）
     Returns:
         episode_scores: 每回合得分列表（Gym内置得分，>200为成功着陆，文档IV.D节评估标准）
     """
@@ -46,7 +40,7 @@ def test_lander_lqr(
     device = next(psi.parameters()).device
     episode_scores: List[float] = []
     all_trajectories: List[List[Tuple[float, float]]] = []  # 存储所有episode的x-y轨迹（文档核心位置维度）
-
+    success_count = 0  # 成功着陆计数（x∈[-0.5,0.5]且y∈[0,0.1]，文档IV.D节评估标准）
     psi.eval()  # 推理模式（禁用梯度，文档测试阶段要求）
     with torch.no_grad():
         for ep in range(num_episodes):
@@ -80,6 +74,8 @@ def test_lander_lqr(
                 step += 1
             print("最终状态:", x_prev)
             # 记录最终位置（确保轨迹完整覆盖“初始→目标”过程，🔶1-87）
+            if abs(x_prev[0]) <= 0.5 and -0.1 <= x_prev[1] <= 0.1:
+                success_count += 1
             trajectory.append((x_prev[0], x_prev[1]))
             all_trajectories.append(trajectory)  # 收集当前episode轨迹
             episode_scores.append(total_score)
@@ -91,7 +87,7 @@ def test_lander_lqr(
     plt.figure(figsize=(10, 8))
     colors = plt.cm.tab10.colors  # 多轨迹颜色区分（避免重叠遮挡，文档图8风格）
     # 画出x_star位置
-    plt.scatter(x_star[0], x_star[1], color="red", marker="x", s=50, edgecolor="black", label="Start")
+    plt.scatter(x_star[0], x_star[1], color="red", marker="o", s=50, edgecolor="black", label="Start")
     for ep, trajectory in enumerate(all_trajectories):
         # 提取x-y坐标（文档核心位置维度）
         x_coords = [p[0] for p in trajectory]
@@ -113,13 +109,12 @@ def test_lander_lqr(
     plt.legend(loc="upper right", bbox_to_anchor=(1.25, 1), fontsize=10)
     plt.grid(True, alpha=0.5)
     # 保存汇总图（确保完整显示图例，文档实验结果保存要求）
-    plt.savefig("lunar_lander_trajectory_summary.png", bbox_inches="tight", dpi=300)
+    plt.savefig(f"lunar_lander_trajectory_summary_{version}.png", bbox_inches="tight", dpi=300)
     plt.close()
 
     # 测试结果统计（文档IV.D节评估标准：平均得分、成功着陆次数）
     avg_score = np.mean(episode_scores)
     std_score = np.std(episode_scores)
-    success_count = sum(score > 200 for score in episode_scores)
     print(f"\n测试总结：平均得分 {avg_score:.1f}±{std_score:.1f} | 成功着陆 {success_count}/{num_episodes} 次")
     return episode_scores
 
@@ -130,7 +125,8 @@ def train_psi_lander(
     x_next: np.ndarray,
     epochs: int = 500,
     batch_size: int = 128,
-    lr: float = 1e-4
+    lr: float = 1e-4,
+    version: str = "v1"
 ) -> Tuple[PsiMLP, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     训练月球着陆器的PsiMLP网络（文档Algorithm 1完整流程）
@@ -143,6 +139,7 @@ def train_psi_lander(
         epochs: 训练轮次（文档II.28节未指定，默认500）
         batch_size: 批量大小（文档II.27节批量训练逻辑，默认128）
         lr: 学习率（文档II.28节用ADAM优化器，默认1e-4）
+        version: PsiMLP版本选择（"v1"为基础版，"v2"为改进版，默认"v1"）
     Returns:
         psi: 训练好的PsiMLP网络（含\(u_0\)）
         A_final: 收敛后的Koopman矩阵，shape=[256,256]（文档Equation 5）
@@ -167,14 +164,24 @@ def train_psi_lander(
 
     # 3. 核心模块初始化（严格匹配文档定义）
     # 3.1 PsiMLP：输入6维，输出256维（N≫6），控制维度2，传入状态上下界
-    psi = PsiMLP(
-        input_dim=6,
-        output_dim=256,
-        control_dim=2,
-        low=state_low,
-        high=state_high,
-        hidden_dims=[256, 256, 256, 256]  # 文档II.28节4层隐藏层
-    ).to(device)
+    if version == "v1":
+        psi = PsiMLP(
+            input_dim=6,
+            output_dim=256,
+            control_dim=2,
+            low=state_low,
+            high=state_high,
+            hidden_dims=[256, 256, 256, 256]  # 文档II.28节4层隐藏层
+        ).to(device)
+    elif version == "v2":
+        psi = PsiMLP_v2(
+            input_dim=6,
+            output_dim=256,
+            control_dim=2,
+            low=state_low,
+            high=state_high,
+            hidden_dims=[256, 256, 256, 256]  # 文档II.28节4层隐藏层
+        ).to(device)
     # 3.2 优化器：ADAM（文档II.28节指定）
     optimizer = optim.Adam(psi.parameters(), lr=lr)
     # 3.3 目标状态x*：文档IV.D节定义为着陆区（x=10, y=4，其余状态为0）
@@ -212,8 +219,8 @@ def train_psi_lander(
                 B=B,
                 u_prev=u_prev_batch,
                 u0=u0_batch,
-                lambda_L1=0.999,
-                lambda_L2=0.001  
+                lambda_L1=0.99,
+                lambda_L2=0.01  
             )
             
             # 4.5 反向传播与参数更新
@@ -230,7 +237,7 @@ def train_psi_lander(
         avg_epoch_loss = total_epoch_loss / len(dataset)
         avg_loss_list.append(avg_epoch_loss)
         print(f"Epoch [{epoch+1:3d}/{epochs}] | 平均总损失：{avg_epoch_loss:.4f} | L1：{L1.item():.4f} | L2：{L2.item():.4f}", end='\r', flush=True)
-    plot_loss_curve(avg_loss_list)
+    plot_loss_curve(avg_loss_list, version)
     # 5. 计算最终A/B/C矩阵（文档Algorithm 1步骤5，用全部数据确保收敛精度）
     psi.eval()
     with torch.no_grad():
@@ -245,12 +252,13 @@ def train_psi_lander(
     print(f"\nPsiMLP训练完成 | A_final.shape: {A_final.shape} | B_final.shape: {B_final.shape} | C_final.shape: {C_final.shape}")
     return psi, A_final, B_final, C_final
 
-def plot_loss_curve(loss_list: List[float]) -> None:
+def plot_loss_curve(loss_list: List[float], version: str) -> None:
     """
     绘制训练损失曲线（便于监控训练过程）
     
     Args:
         loss_list: 每个epoch的平均损失列表
+        version: PsiMLP版本标识（用于保存文件命名）
     """
     plt.figure(figsize=(10, 6))
     plt.plot(loss_list, label='Average Loss per Epoch')
@@ -260,7 +268,7 @@ def plot_loss_curve(loss_list: List[float]) -> None:
     plt.yscale('log')  # 对数刻度便于观察收敛趋势
     plt.grid(True)
     plt.legend()
-    plt.savefig('training_loss_curve.png')
+    plt.savefig(f'training_loss_curve_{version}.png')
 
 if __name__ == "__main__":
     # 完整DKRC流程（文档IV.D节实验步骤：数据生成→网络训练→控制测试）
@@ -270,23 +278,28 @@ if __name__ == "__main__":
         num_episodes=10,  # 文档指定5次，对应1876组数据
         noise_scale=0.1  # 文档IV.D节指定噪声强度
     )
-     
+    print("\n" + "="*50 + " 步骤2/3：训练PsiMLP网络 " + "="*50)
+    test_version = "v2"   
     # 步骤2：训练PsiMLP网络（文档II.28节+Algorithm 1）
-    print("\n" + "="*50 + " 步骤2/3：训练PsiMLP网络（文档Algorithm 1） " + "="*50)
+    
     psi_lander, A_lander, B_lander, C_lander = train_psi_lander(
         x_prev=x_prev,
         u_prev=u_prev,
         x_next=x_next,
         epochs=50,  # 足够轮次确保收敛
         batch_size=256,
-        lr=1e-5
+        lr=1e-5,
+        version=test_version
     )
-
     # 步骤3：LQR控制测试（文档III节+IV.D节，用训练后的A/B计算LQR增益）
     print("\n" + "="*50 + " 步骤3/3：LQR控制测试（文档III节） " + "="*50)
     # 目标状态x*：文档IV.D节定义（x=0, y=0，其余为0）
     x_star_lander = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=next(psi_lander.parameters()).device)
     # 求解LQR增益（文档III节离散黎卡提方程）
-    K_lqr = solve_discrete_lqr(A_lander, B_lander)
+    if test_version == "v1":
+
+        K_lqr = solve_discrete_lqr(A_lander, B_lander)
+    elif test_version == "v2":
+        K_lqr = solve_discrete_lqr_v2(A_lander, B_lander)
     # 测试控制效果（文档IV.D节10次测试）
-    test_lander_lqr(psi_lander, K_lqr, x_star_lander, num_episodes=10)
+    test_lander_lqr(psi_lander, K_lqr, x_star_lander, num_episodes=10, version=test_version)

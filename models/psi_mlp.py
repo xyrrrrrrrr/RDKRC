@@ -110,9 +110,9 @@ class PsiMLP(nn.Module):
             torch.Tensor: 高维基函数批量，形状[batch_size, output_dim]
         """
         # 先归一化再输入MLP（符合数据驱动训练逻辑）
-        # x_norm = self.normalize_x(x)
-        # return self.psi_mlp(x_norm)
-        return self.psi_mlp(x)
+        x_norm = self.normalize_x(x)
+        return self.psi_mlp(x_norm)
+        # return self.psi_mlp(x)
 
     def compute_z(self, x: torch.Tensor, x_star: torch.Tensor) -> torch.Tensor:
         """
@@ -247,6 +247,7 @@ class PsiMLP_v2(nn.Module):
         """
         # 状态归一化
         x_norm = self.normalize_x(x)
+        # x_norm = x
         
         # 改进1：状态注意力机制（权重逐元素相乘）
         attention_weights = self.attention(x_norm)  # [batch_size, input_dim]
