@@ -8,7 +8,9 @@ from typing import Tuple, List
 def update_A_B(
     z_prev: torch.Tensor,
     z_next: torch.Tensor,
-    u_prev: torch.Tensor
+    u_prev: torch.Tensor,
+    A_init: torch.Tensor,
+    B_init: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     基于《Deep Learning of Koopman Representation for Control.pdf》Equation 8，
@@ -24,6 +26,8 @@ def update_A_B(
         z_prev: t时刻线性化状态（原文公式4的z(x_t)），形状[batch_size, N]（如64, 128）；
         z_next: t+1时刻线性化状态（原文公式4的z(x_{t+1})），形状[batch_size, N]（如64, 128）；
         u_prev: t时刻控制输入（原文公式1的u_t），形状[batch_size, m]（m为控制维度，如64, 1）。
+        A_init: 初始化的Koopman矩阵A（未使用，仅为接口统一保留）；
+        B_init: 初始化的控制矩阵B（未使用，仅为接口统一保留）。
     
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -49,7 +53,6 @@ def update_A_B(
 
         # 3.2 构建原文Equation 8的[z_t; U]（纵向拼接，dim=0）[N+m, 1]（如128+1=129, 1）
         X_i = torch.cat([z_prev_i, u_prev_i], dim=0)  # 严格匹配原文“[z_t; U]”的结构
-
         # 3.3 计算原文Gram矩阵及其伪逆（Equation 8的([z_t U]·[z_t; U]^T)^†）
         X_i_T = X_i.T  # [1, N+m]
         gram_matrix_i = X_i @ X_i_T  # 结果为[N+m, N+m]（符合原文维度）
@@ -71,6 +74,14 @@ def update_A_B(
     A = torch.stack(single_A_list).mean(dim=0)  # [batch_size, N, N]→[N, N]
     B = torch.stack(single_B_list).mean(dim=0)  # [batch_size, N, m]→[N, m]
 
+    A_col_norm = torch.norm(A, dim=0, keepdim=True) + 1e-8  # [1, N]
+    A_normalized = A / A_col_norm  # 归一化后的A，数值规模可控
+    B_col_norm = torch.norm(B, dim=0, keepdim=True) + 1e-8  # [1, m]
+    B_normalized = B / B_col_norm  # 归一化后的B，
+
+    A = 0.5 * A_init.detach() + 0.5 * A_normalized  # 平滑更新，防止训练初期A剧烈波动
+    B = 0.5 * B_init.detach() + 0.5 * B_normalized  # 同上
+    
     return A, B
 
 
@@ -123,7 +134,8 @@ def compute_C_matrix(
     # 4. 批量平均（原文Section II.42：批量数据提升C矩阵重构精度，减少单样本噪声干扰）
     # 将所有样本的C_i堆叠后按样本维度（dim=0）取平均，最终维度为[n, N]
     C = torch.stack(single_C_list).mean(dim=0)  # [batch_size, n, N] → [n, N]
-
+    C_col_norm = torch.norm(C, dim=0, keepdim=True) + 1e-8  # [1, N]
+    C_normalized = C / C_col_norm  # 归一化后的C，数值规模可控
     # 验证约束C·Ψ₀=0（原文Equation 9的约束，因z_t=Ψ(x_t)-Ψ₀，批量平均后仍满足该约束）
     return C
 

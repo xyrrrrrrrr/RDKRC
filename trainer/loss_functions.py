@@ -1,98 +1,108 @@
 import torch
 import torch.nn.functional as F
-from typing import Tuple, List
+from typing import Tuple
 from rdkrc.utils.matrix_utils import compute_controllability_matrix
 
 
 def compute_L1_loss(
-    z_prev_batch: torch.Tensor,  # 原文Batch版z(x_t)：[N, BatchSize]，每列=单个z_prev_i（[N,1]）
-    z_next_batch: torch.Tensor   # 原文Batch版z(x_{t+1})：[N, BatchSize]，每列=单个z_next_i（[N,1]）
+    z_prev: torch.Tensor,
+    z_next: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    u_prev: torch.Tensor,
+    u0: torch.Tensor
 ) -> torch.Tensor:
     """
-    分离Batch中每个z的L1损失计算（完全基于原文）
-    逻辑：对Batch中每个样本的z_prev_i、z_next_i单独计算，再汇总损失
-    对应原文Algorithm 1步骤2：L1(θ) = (1/(L-1))·Σ||z(x_{t+1}) - K·z(x_t)||，K=z(x_{t+1})·z(x_t)^†
+    计算L1损失（文档Algorithm 1步骤2 + Equation 7）：
+    确保高维线性系统的预测误差最小化，核心公式为：
+    L1(θ) = (1/L) · Σ||z_{t+1} - A z_t - B(u_t - u0)||_F 
+    （L为批量大小，对应文档“t=0到L-1求和”，L = 批量样本数）
     
+    文档依据：
+    - Algorithm 1步骤2：L1(θ) = (1/(L-1))·Σ||z(x_{t+1}) - K·z(x_t)||（K为Koopman算子初步近似）
+    - Section II Equation 7：L = Σ||z_{t+1} - A z_t - B(u - u0)||_F（最终线性模型误差）
+    此处融合两者：用当前迭代的A/B替代K，加入u0项，确保线性模型精度。
+
     Args:
-        z_prev_batch: 原文Batch线性化状态z(x_t)，维度[N, BatchSize]（N=基函数维度，如128）
-        z_next_batch: 原文Batch线性化状态z(x_{t+1})，维度[N, BatchSize]
-    
+        z_prev (torch.Tensor): t时刻高维状态z(x_t)，形状[batch_size, N]（N=基函数维度，如128）
+        z_next (torch.Tensor): t+1时刻高维状态z(x_{t+1})，形状[batch_size, N]
+        A (torch.Tensor): 当前迭代的Koopman矩阵，形状[N, N]（来自`matrix_utils.update_A_B`）
+        B (torch.Tensor): 当前迭代的控制矩阵，形状[N, m]（m=控制维度，如倒立摆m=1）
+        u_prev (torch.Tensor): t时刻控制输入，形状[batch_size, m]（与`matrix_utils.update_A_B`输入一致）
+        u0 (torch.Tensor): 控制固定点（来自PsiMLP.forward_u0），形状[batch_size, m]
+
     Returns:
-        total_L1: Batch总L1损失（标量，对应原文求和后平均）
-        single_K_list: 每个样本的Koopman算子K_i列表（每个元素[N,N]，对应原文单样本K）
-        single_error_list: 每个样本的线性误差列表（每个元素[N,1]，对应原文单样本误差）
+        torch.Tensor: 批量平均后的L1损失（标量）
     """
-    BatchSize = z_prev_batch.shape[1]  # Batch样本数（如64）
-    L1_sum = torch.tensor(0.0)  # 初始化总L1损失
-
-    # -------------------------- 步骤1：分离Batch，逐个处理每个样本的z --------------------------
-    for i in range(BatchSize):
-        # 1.1 提取单个样本的z（严格匹配原文单样本z维度[N,1]）
-        z_prev_i = z_prev_batch[:, i].unsqueeze(1)  # 第i个样本的z(x_t)：[N,1]
-        z_next_i = z_next_batch[:, i].unsqueeze(1)  # 第i个样本的z(x_{t+1})：[N,1]
-        # 1.2 单样本计算Koopman算子K_i（原文K=z(x_{t+1})·z(x_t)^†）
-        # 原文单样本Gram矩阵：z_prev_i · z_prev_i^T → [N,1] @ [1,N] = [N,N]（符合原文线性算子近似需求）
-        z_prev_i_T = z_prev_i.T  # [1,N]
-        gram_matrix_i = z_prev_i @ z_prev_i_T  # [N,N]
-        # 单样本伪逆（原文公式8中A/B更新用伪逆，此处完全复用逻辑）
-        gram_matrix_pinv_i = torch.pinverse(gram_matrix_i)  # [N,N]
-        # 单样本K_i：K_i = z_next_i · z_prev_i^T · gram_matrix_pinv_i → 维度链[N,1]@[1,N]@[N,N] = [N,N]
-        K_i = (z_next_i @ z_prev_i_T) @ gram_matrix_pinv_i  # 严格匹配原文K定义
-
-        # 1.3 单样本计算线性误差（原文误差项||z(x_{t+1}) - K·z(x_t)||）
-        # 单样本线性预测：K_i · z_prev_i → [N,N] @ [N,1] = [N,1]（匹配z_next_i维度）
-        linear_pred_i = K_i @ z_prev_i
-        # 单样本误差：z_next_i - linear_pred_i → [N,1]
-        error_i = z_next_i - linear_pred_i
-
-        # 1.4 单样本计算L1误差（原文||·||：F范数）
-        l1_i = torch.norm(error_i, p='fro')  # 标量，单样本误差范数
-        L1_sum += l1_i  # 累加到总L1损失
-
-    # -------------------------- 步骤2：汇总Batch损失（符合原文求和平均逻辑） --------------------------
-    # 原文L1(θ)是对时间序列L个样本求和后除以L-1, L= BatchSize
-    total_L1 = L1_sum / (BatchSize - 1)  # 标量，Batch总L1损失
-
+    # 1. 设备一致性确保（避免CPU/GPU混合计算错误）
+    device = z_prev.device
+    A, B, u_prev, u0 = A.to(device), B.to(device), u_prev.to(device), u0.to(device)
+    
+    # 2. 计算变换后控制输入v_t = u_t - u0（文档Equation 4）
+    v_prev = u_prev - u0  # 形状[batch_size, m]
+    
+    # 3. 高维线性模型预测z_next（文档Equation 5：z_{t+1} = A z_t + B v_t）
+    # 批量矩阵乘法：z_prev [B,N] × A.T [N,N] → [B,N]；v_prev [B,m] × B.T [m,N] → [B,N]
+    z_next_pred = torch.matmul(z_prev, A.T) + torch.matmul(v_prev, B.T)  # 形状[batch_size, N]
+    
+    # 4. 计算每个样本的F范数误差（文档Equation 7的||·||_F）
+    # dim=1：对每个样本的N维特征计算F范数（等价于L2范数）
+    sample_errors = torch.norm(z_next - z_next_pred, p='fro', dim=1)  # 形状[batch_size]
+    
+    # 5. 批量平均（文档Algorithm 1步骤2的1/(L-1)，此处L=batch_size，因批量为t=0到L-1的L个样本）
+    total_L1 = sample_errors.mean()  # 等价于sum(sample_errors) / batch_size
+    
     return total_L1
 
 
 def compute_L2_loss(
     A: torch.Tensor,
     B: torch.Tensor,
-    lambda_rank: float = 1.0,
-    lambda_A: float = 0.1,
-    lambda_B: float = 0.1
+    lambda_rank: float = 0.2,
+    lambda_A: float = 0.4,
+    lambda_B: float = 0.4
 ) -> torch.Tensor:
     """
-    计算L2损失:保证系统能控性与矩阵稀疏性(原文Algorithm 1中L2定义)
-    L2 = λ_rank·(N - rank(Cont(A,B))) + λ_A·||A||₁ + λ_B·||B||₁
-    其中Cont(A,B)为能控性矩阵,N为基函数维度
-    
+    计算L2损失（文档Algorithm 1步骤3）：
+    确保系统能控性与矩阵参数正则化，核心公式为：
+    L2(θ) = (N - rank(Cont(A,B))) + ||A||₁ + ||B||₁
+    其中Cont(A,B)为能控性矩阵（由`matrix_utils.compute_controllability_matrix`计算）。
+
+    文档依据：
+    - Algorithm 1步骤3：L2(θ) = (N - rank(controllability(A,B))) + ||A||₁ + ||B||₁
+    - 注：lambda_rank/A/B为超参数，文档未指定权重，默认设为1.0以对齐原文结构，可按需调整。
+
     Args:
-        A (torch.Tensor): Koopman线性化矩阵,形状[N, N]
-        B (torch.Tensor): 控制输入矩阵,形状[N, m](m为控制维度)
-        lambda_rank (float): 能控性秩惩罚权重(默认1.0)
-        lambda_A (float): A矩阵1范数惩罚权重(默认0.1)
-        lambda_B (float): B矩阵1范数惩罚权重(默认0.1)
-    
+        A (torch.Tensor): Koopman矩阵，形状[N, N]
+        B (torch.Tensor): 控制矩阵，形状[N, m]
+        lambda_rank (float): 能控性秩惩罚权重（默认1.0，对齐原文）
+        lambda_A (float): A矩阵1范数惩罚权重（默认1.0，对齐原文）
+        lambda_B (float): B矩阵1范数惩罚权重（默认1.0，对齐原文）
+
     Returns:
-        torch.Tensor: L2损失值(标量)
+        torch.Tensor: L2损失（标量）
     """
-    N = A.shape[0]
-    # 1. 计算能控性矩阵及其秩
-    controllability_mat = compute_controllability_matrix(A, B)  # [N, N×m]
-    # 用SVD求秩(奇异值大于1e-6的数量)
+    # 1. 设备一致性确保
+    device = A.device
+    B = B.to(device)
+    
+    # 2. 计算能控性矩阵（调用`matrix_utils`的辅助函数，严格对齐文档定义）
+    controllability_mat = compute_controllability_matrix(A, B)  # 形状[N, N×m]
+    
+    # 3. 计算能控性矩阵的秩（奇异值>1e-5视为有效秩，避免数值误差）
     _, singular_vals, _ = torch.svd(controllability_mat)
-    rank = (singular_vals > 1e-6).sum().item()
-    rank_penalty = lambda_rank * (N - rank)
+    rank = (singular_vals > 1e-5).sum().item()  # 有效秩
+    N = A.shape[0]
+    rank_penalty = lambda_rank * (N - rank)  # 能控性惩罚（秩不足则惩罚增大）
     
-    # 2. 计算A、B矩阵的1范数(稀疏性惩罚)
-    A_l1 = lambda_A * torch.norm(A, p=1)
-    B_l1 = lambda_B * torch.norm(B, p=1)
+    # 4. 计算A/B的1范数（文档Algorithm 1步骤3的正则化项）
+    A_l1 = lambda_A * torch.norm(A, p=1)  # A矩阵1范数
+    B_l1 = lambda_B * torch.norm(B, p=1)  # B矩阵1范数
     
-    # 总L2损失
-    L2 = rank_penalty + A_l1 + B_l1
-    return L2
+    # 5. 总L2损失（文档定义的三项之和）
+    total_L2 = rank_penalty + A_l1 + B_l1
+    
+    return total_L2
 
 
 def compute_total_loss(
@@ -100,29 +110,43 @@ def compute_total_loss(
     z_next: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
+    u_prev: torch.Tensor,
+    u0: torch.Tensor,
     lambda_L1: float = 1.0,
     lambda_L2: float = 1.0,
     **kwargs
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    计算DKRC总损失:L = λ_L1·L1 + λ_L2·L2
-    
+    计算DKRC总损失（文档Algorithm 1步骤4）：
+    总损失 = λ_L1·L1 + λ_L2·L2（λ_L1/λ_L2为损失平衡超参数，默认1.0）
+
+    文档依据：
+    - Algorithm 1步骤4：L(θ) = L1(θ) + L2(θ)（此处保留λ_L1/λ_L2以支持灵活调参，默认对齐原文）
+
     Args:
-        z_prev (torch.Tensor): t时刻z(x_t),[batch_size, N]
-        z_next (torch.Tensor): t+1时刻z(x_{t+1}),[batch_size, N]
-        A (torch.Tensor): Koopman矩阵A,[N, N]
-        B (torch.Tensor): 控制矩阵B,[N, m]
-        lambda_L1 (float): L1损失权重(默认1.0)
-        lambda_L2 (float): L2损失权重(默认1.0)
-        **kwargs: 传递给compute_L2_loss的额外参数(如lambda_rank)
-    
+        z_prev (torch.Tensor): t时刻高维状态，形状[batch_size, N]
+        z_next (torch.Tensor): t+1时刻高维状态，形状[batch_size, N]
+        A (torch.Tensor): Koopman矩阵，形状[N, N]
+        B (torch.Tensor): 控制矩阵，形状[N, m]
+        u_prev (torch.Tensor): t时刻控制输入，形状[batch_size, m]
+        u0 (torch.Tensor): 控制固定点，形状[batch_size, m]
+        lambda_L1 (float): L1损失权重（默认1.0，对齐原文）
+        lambda_L2 (float): L2损失权重（默认1.0，对齐原文）
+        **kwargs: 传递给`compute_L2_loss`的额外参数（如lambda_rank）
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            total_loss: 总损失,
-            L1: L1损失,
-            L2: L2损失
+            total_loss: 总损失（标量）
+            L1: L1损失（标量）
+            L2: L2损失（标量）
     """
-    L1 = compute_L1_loss(z_prev, z_next)
+    # 1. 计算L1损失（传入A/B/u_prev/u0，对齐线性模型误差）
+    L1 = compute_L1_loss(z_prev, z_next, A, B, u_prev, u0)
+    
+    # 2. 计算L2损失（调用`compute_L2_loss`，支持额外超参数）
     L2 = compute_L2_loss(A, B, **kwargs)
+    
+    # 3. 计算总损失（文档Algorithm 1步骤4）
     total_loss = lambda_L1 * L1 + lambda_L2 * L2
+    
     return total_loss, L1, L2

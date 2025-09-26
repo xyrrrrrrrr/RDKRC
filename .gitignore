@@ -1,0 +1,5 @@
+# 忽略所有 Python 编译生成的 .pyc 文件
+*.pyc
+
+# 忽略所有 __pycache__ 文件夹（及其内部内容）
+__pycache__/

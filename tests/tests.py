@@ -67,7 +67,9 @@ def test_loss_and_matrix_utils():
     assert L1.dim() == 0, f"L1损失应为标量,实际维度{L1.dim()}"
     
     # 2. 测试A/B更新
-    A, B = update_A_B(z_prev, z_next, u_prev)
+    A = torch.randn(N, N)
+    B = torch.randn(N, m)
+    A, B = update_A_B(z_prev, z_next, u_prev, A, B)
     assert A.shape == (N, N), f"A矩阵维度错误:预期({N}, {N}),实际{A.shape}"
     assert B.shape == (N, m), f"B矩阵维度错误:预期({N}, {m}),实际{B.shape}"
     

@@ -6,6 +6,13 @@ from .trainer.loss_functions import compute_L1_loss, compute_L2_loss, compute_to
 
 # 导出工具函数
 from .utils.matrix_utils import update_A_B, compute_C_matrix, compute_controllability_matrix
+from .utils.data_utils import generate_lunar_lander_data
+
+# 导出控制器
+from .controller.lqr_controller import solve_discrete_lqr
+
+# 导出模型
+from .models.psi_mlp import PsiMLP
 
 # 版本标识
 __version__ = "0.1.0"
@@ -14,5 +21,8 @@ __version__ = "0.1.0"
 __all__ = [
     "PsiMLP",
     "compute_L1_loss", "compute_L2_loss", "compute_total_loss",
-    "update_A_B", "compute_C_matrix", "compute_controllability_matrix"
+    "update_A_B", "compute_C_matrix", "compute_controllability_matrix",
+    "generate_lunar_lander_data",
+    "solve_discrete_lqr",
+    "PsiMLP"
 ]
