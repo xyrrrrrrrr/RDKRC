@@ -78,7 +78,7 @@ def test_lander_lqr(
                 total_score += reward
                 x_prev = x_next[0:6]
                 step += 1
-
+            print("最终状态:", x_prev)
             # 记录最终位置（确保轨迹完整覆盖“初始→目标”过程，🔶1-87）
             trajectory.append((x_prev[0], x_prev[1]))
             all_trajectories.append(trajectory)  # 收集当前episode轨迹
@@ -223,9 +223,9 @@ def train_psi_lander(
             
             total_epoch_loss += total_loss.item() * batch_size  # 累积 epoch 损失
         # 每过20个epoch降低一次学习率
-        if (epoch + 1) % 20 == 0:
+        if (epoch + 1) % 50 == 0:
             for param_group in optimizer.param_groups:
-                param_group['lr'] *= 0.1
+                param_group['lr'] *= 0.5
         # 打印epoch信息（平均损失，便于监控收敛）
         avg_epoch_loss = total_epoch_loss / len(dataset)
         avg_loss_list.append(avg_epoch_loss)
@@ -278,7 +278,7 @@ if __name__ == "__main__":
         u_prev=u_prev,
         x_next=x_next,
         epochs=50,  # 足够轮次确保收敛
-        batch_size=128,
+        batch_size=256,
         lr=1e-5
     )
 

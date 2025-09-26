@@ -151,3 +151,126 @@ class PsiMLP(nn.Module):
         batch_size = x.shape[0]
         # 扩展常数u₀到批量维度：[control_dim] → [1, control_dim] → [batch_size, control_dim]
         return self.u0.unsqueeze(0).expand(batch_size, -1)
+    
+
+class PsiMLP_v2(nn.Module):
+    """
+    改进版Koopman基函数学习网络（增强表达能力）
+    改进点：
+    1. 加入状态注意力机制，自动聚焦关键状态维度
+    2. 采用混合激活函数（tanh + Swish），缓解梯度饱和
+    3. 多尺度特征融合，增强对不同频率动态的捕捉能力
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        control_dim: int,
+        low: Union[List[float], np.ndarray],
+        high: Union[List[float], np.ndarray],
+        hidden_dims: List[int] = None,
+        activation: nn.Module = None,
+        device: Optional[torch.device] = None
+    ):
+        super().__init__()
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 核心参数保持不变
+        self.input_dim = input_dim  # 原状态维度n（如月球着陆器n=6）
+        self.output_dim = output_dim  # 高维空间维度N
+        self.control_dim = control_dim  # 控制输入维度m
+        
+        # 状态归一化参数（解耦环境依赖）
+        self.low = torch.tensor(low, dtype=torch.float32, device=self.device)
+        self.high = torch.tensor(high, dtype=torch.float32, device=self.device)
+        assert self.low.shape[0] == input_dim and self.high.shape[0] == input_dim, \
+            f"low/high维度需与input_dim({input_dim})一致"
+        
+        # 改进1：状态注意力机制（聚焦关键状态维度）
+        self.attention = nn.Sequential(
+            nn.Linear(input_dim, input_dim, device=self.device),  # 学习状态维度权重
+            nn.Sigmoid()  # 输出注意力权重∈[0,1]
+        )
+        
+        # 改进2：多尺度分支结构（拆分低维/高维特征）
+        self.hidden_dims = hidden_dims or [256, 256, 256, 256]
+        # 低维分支（捕捉慢变特征，如位置、高度）
+        self.branch_low = self._build_branch(
+            input_dim=input_dim,
+            hidden_dims=self.hidden_dims,
+            output_dim=output_dim // 4  # 分配1/4维度（如256→64）
+        )
+        # 高维分支（捕捉快变特征，如角速度、速度）
+        self.branch_high = self._build_branch(
+            input_dim=input_dim,
+            hidden_dims=self.hidden_dims,
+            output_dim=output_dim - (output_dim // 4)  # 剩余3/4维度（如256→192）
+        )
+        
+        # 控制输入固定点u₀（保持原设计）
+        self.u0 = nn.Parameter(
+            torch.zeros(control_dim, dtype=torch.float32, device=self.device),
+            requires_grad=True
+        )
+
+    def _build_branch(self, input_dim: int, hidden_dims: List[int], output_dim: int) -> nn.Sequential:
+        """构建多尺度分支网络（改进2：混合激活函数）"""
+        layers = []
+        in_dim = input_dim
+        
+        for i, hidden_dim in enumerate(hidden_dims):
+            layers.append(nn.Linear(in_dim, hidden_dim, device=self.device))
+            # 改进2：前两层用tanh（局部非线性），后两层用Swish（缓解梯度饱和）
+            if i < 2:
+                layers.append(nn.Tanh())
+            else:
+                layers.append(nn.SiLU())  # Swish激活函数
+            in_dim = hidden_dim
+        
+        # 分支输出层
+        layers.append(nn.Linear(in_dim, output_dim, device=self.device))
+        return nn.Sequential(*layers)
+
+    def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        """状态归一化（保持原逻辑）"""
+        x = x.to(self.device, dtype=torch.float32)
+        x_clamped = torch.clamp(x, self.low, self.high)
+        x_norm = (x_clamped - self.low) / (self.high - self.low + 1e-8)
+        return x_norm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播（融合改进1/2/3）：
+        1. 状态注意力加权
+        2. 多尺度分支特征提取
+        3. 特征融合输出
+        """
+        # 状态归一化
+        x_norm = self.normalize_x(x)
+        
+        # 改进1：状态注意力机制（权重逐元素相乘）
+        attention_weights = self.attention(x_norm)  # [batch_size, input_dim]
+        x_attended = x_norm * attention_weights     # 关键维度增强，次要维度抑制
+        
+        # 改进3：多尺度特征融合
+        feat_low = self.branch_low(x_attended)   # 慢变特征（如位置y、角度θ）
+        feat_high = self.branch_high(x_attended) # 快变特征（如角速度θ_dot、速度ẏ）
+        psi_x = torch.cat([feat_low, feat_high], dim=1)  # 融合特征
+        
+        return psi_x
+
+    def compute_z(self, x: torch.Tensor, x_star: torch.Tensor) -> torch.Tensor:
+        """计算高维线性空间状态z（保持原逻辑）"""
+        x_star = x_star.to(self.device, dtype=torch.float32)
+        if x_star.dim() == 1:
+            x_star = x_star.unsqueeze(0)
+        x_star_batch = x_star.expand(x.shape[0], -1)
+        
+        psi_x = self.forward(x)
+        psi_x_star = self.forward(x_star_batch)
+        return psi_x - psi_x_star
+
+    def forward_u0(self, x: torch.Tensor) -> torch.Tensor:
+        """输出控制输入固定点u₀（保持原逻辑）"""
+        batch_size = x.shape[0]
+        return self.u0.unsqueeze(0).expand(batch_size, -1)
