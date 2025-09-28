@@ -3,3 +3,7 @@
 
 # 忽略所有 __pycache__ 文件夹（及其内部内容）
 __pycache__/
+
+*.npz
+
+data/

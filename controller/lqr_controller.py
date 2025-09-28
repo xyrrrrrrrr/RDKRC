@@ -6,8 +6,8 @@ import scipy.linalg as la
 def solve_discrete_lqr(
     A: torch.Tensor,
     B: torch.Tensor,
-    Q: np.ndarray = np.diag([1] * 256),  # 月球着陆器状态成本矩阵（论文IV.D节指定）
-    R: np.ndarray = np.diag([0.1, 0.1])
+    Q: np.ndarray = None,  # 月球着陆器状态成本矩阵（论文IV.D节指定）
+    R: np.ndarray = None
 ) -> np.ndarray:
     """
     求解离散LQR控制增益K_lqr（论文III节）
@@ -26,7 +26,10 @@ def solve_discrete_lqr(
     B_np = B.cpu().detach().numpy()
     print("A的形状：", A_np.shape)
     print("B的形状：", B_np.shape)
-    print("Q的形状：", Q.shape)
+    N = A_np.shape[0]
+    m = B_np.shape[1]
+    Q = np.diag([1.0] * N) if Q is None else Q  # 状态成本矩阵（论文IV.D节指定）
+    R = np.diag([0.1] * m) if R is None else R  # 控制成本矩阵（论文IV.D节指定）
     # 求解离散黎卡提方程（论文III节核心公式）
     P = la.solve_discrete_are(A_np, B_np, Q, R)
 
@@ -62,7 +65,7 @@ def solve_discrete_lqr_v2(
         # - 低维分支（关键特征）：权重=10（匹配论文对原始状态y/θ的高惩罚）
         # - 高维分支（辅助特征）：权重=1（抑制震荡，避免过度惩罚）
         Q_diag = np.ones(N, dtype=np.float32)  # 基础权重
-        Q_diag[:low_dim_size] = 10.0  # 低维分支（前64维）权重提升到10
+        Q_diag[:low_dim_size] = 100.0  # 低维分支（前64维）权重提升到10
         
         Q = np.diag(Q_diag)  # 最终Q形状仍为[256,256]，维度匹配A
     

@@ -1,4 +1,5 @@
 import gym
+import os
 import numpy as np
 from typing import Tuple
 
@@ -6,7 +7,8 @@ from typing import Tuple
 def generate_lunar_lander_data(
     num_episodes: int = 10,
     noise_scale: float = 0.1,
-    env_name: str = "LunarLanderContinuous-v2"
+    env_name: str = "LunarLanderContinuous-v2",
+    seed: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     生成论文IV.D节月球着陆器训练数据：随机策略+Ornstein-Uhlenbeck噪声
@@ -16,6 +18,7 @@ def generate_lunar_lander_data(
         num_episodes: 生成数据的游戏次数（论文指定5次，对应1876组数据）
         noise_scale: Ornstein-Uhlenbeck噪声强度（论文IV.D节用0.1）
         env_name: 环境名（固定为月球着陆器环境，不修改）
+        seed: 随机种子，确保结果可复现（默认2，论文未指定）
     
     Returns:
         x_prev: 原始状态序列，shape=[total_samples, 6]（6维：x,y,θ,ẋ,ẏ,θ_dot）
@@ -23,6 +26,7 @@ def generate_lunar_lander_data(
         x_next: 下一状态序列，shape=[total_samples, 6]
     """
     env = gym.make(env_name)
+    env.seed(seed)
     x_prev_list: list[np.ndarray] = []
     u_prev_list: list[np.ndarray] = []
     x_next_list: list[np.ndarray] = []
@@ -57,6 +61,15 @@ def generate_lunar_lander_data(
     x_prev = np.array(x_prev_list, dtype=np.float32)
     u_prev = np.array(u_prev_list, dtype=np.float32)
     x_next = np.array(x_next_list, dtype=np.float32)
-
+    # 保存至/data/lunar_lander_data_seed{seed}_episodes{num_episodes}.npz
+    # 检查是否有data目录，没有则创建
+    if not os.path.exists("./data"):
+        os.makedirs("./data")
+    np.savez_compressed(
+        f"./data/lunar_lander_data_seed{seed}_episodes{num_episodes}.npz",
+        x_prev=x_prev,
+        u_prev=u_prev,
+        x_next=x_next
+    )
     print(f"数据生成完成：{x_prev.shape[0]}组数据（论文目标1876组）")
     return x_prev, u_prev, x_next

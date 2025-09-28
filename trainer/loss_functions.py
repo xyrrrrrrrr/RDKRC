@@ -58,9 +58,9 @@ def compute_L1_loss(
 def compute_L2_loss(
     A: torch.Tensor,
     B: torch.Tensor,
-    lambda_rank: float = 0.1,
-    lambda_A: float = 0.45,
-    lambda_B: float = 0.45
+    lambda_rank: float = 0.8,
+    lambda_A: float = 0.1,
+    lambda_B: float = 0.1
 ) -> torch.Tensor:
     """
     计算L2损失（文档Algorithm 1步骤3）：
@@ -93,7 +93,7 @@ def compute_L2_loss(
     _, singular_vals, _ = torch.svd(controllability_mat)
     rank = (singular_vals > 1e-5).sum().item()  # 有效秩
     N = A.shape[0]
-    rank_penalty = lambda_rank * (N - rank)  # 能控性惩罚（秩不足则惩罚增大）
+    rank_penalty = lambda_rank * (N - rank) / N  # 归一化秩惩罚，避免随N变化过大
     
     # 4. 计算A/B的1范数（文档Algorithm 1步骤3的正则化项）
     A_l1 = lambda_A * torch.norm(A, p=1)  # A矩阵1范数
@@ -132,6 +132,7 @@ def compute_total_loss(
         u0 (torch.Tensor): 控制固定点，形状[batch_size, m]
         lambda_L1 (float): L1损失权重（默认1.0，对齐原文）
         lambda_L2 (float): L2损失权重（默认1.0，对齐原文）
+        version (str): 损失版本（"v1"或"v2"）
         **kwargs: 传递给`compute_L2_loss`的额外参数（如lambda_rank）
 
     Returns:
@@ -148,5 +149,64 @@ def compute_total_loss(
     
     # 3. 计算总损失（文档Algorithm 1步骤4）
     total_loss = lambda_L1 * L1 + lambda_L2 * L2
-    
+        
     return total_loss, L1, L2
+
+def compute_L_track(z_fused: torch.Tensor, z_ref: torch.Tensor) -> torch.Tensor:
+    """
+    z_fused: 模型输出的时序特征 [batch, T, 256]
+    z_ref: 参考轨迹的时序特征（由参考状态x_ref通过PsiMLP生成） [batch, T, 256]
+    返回：时序MSE损失（含帧间平滑项）
+    """
+    # 1. 帧内跟踪误差（每帧z与参考z的MSE）
+    frame_loss = torch.norm(z_fused - z_ref, p=2, dim=2).mean()  # [batch, T] → 标量
+    
+    # 2. 帧间平滑误差（避免相邻帧跳变，现实硬件需平滑控制）
+    smooth_loss = torch.norm(z_fused[:, 1:, :] - z_fused[:, :-1, :], p=2, dim=2).mean()
+    
+    # 总跟踪损失（平滑项权重0.5，平衡精度与平滑）
+    return frame_loss + 0.5 * smooth_loss
+
+def compute_L_obstacle(x_seq: torch.Tensor, obs: torch.Tensor, safe_dist=0.5) -> torch.Tensor:
+    """
+    x_seq: 时序状态 [batch, T, input_dim]（input_dim含x/y坐标，如2D场景取前2维）
+    obs: 障碍物信息 [batch, 4]（x_min,y_min,x_max,y_max）
+    safe_dist: 安全距离（如0.5m，根据现实硬件尺寸设定）
+    返回：障碍规避损失（仅当距离<安全阈值时惩罚）
+    """
+    batch_size, T, _ = x_seq.shape
+    # 提取状态的x/y坐标（假设前2维为位置）
+    x_pos = x_seq[..., 0].unsqueeze(2)  # [batch, T, 1]
+    y_pos = x_seq[..., 1].unsqueeze(2)  # [batch, T, 1]
+    
+    # 计算到障碍物的最小距离（2D轴对齐障碍框）
+    # 障碍左边界距离：x_pos - obs[...,0]（x_pos > obs左边界时为正）
+    dist_left = x_pos - obs[:, 0].unsqueeze(1).unsqueeze(2).expand(-1, T, -1)  # [batch, T, 1]
+    dist_right = obs[:, 2].unsqueeze(1).unsqueeze(2).expand(-1, T, -1) - x_pos  # [batch, T, 1]
+    dist_bottom = y_pos - obs[:, 1].unsqueeze(1).unsqueeze(2).expand(-1, T, -1)  # [batch, T, 1]
+    dist_top = obs[:, 3].unsqueeze(1).unsqueeze(2).expand(-1, T, -1) - y_pos     # [batch, T, 1]
+    
+    # 最小距离（仅取正距离，即状态在障碍外的距离）
+    min_dist = torch.min(torch.cat([dist_left, dist_right, dist_bottom, dist_top], dim=2), dim=2)[0]  # [batch, T]
+    
+    # 势场损失：距离越近，惩罚越大（Hinge损失变体）
+    obstacle_loss = torch.max(torch.tensor(0.0, device=x_seq.device), safe_dist - min_dist).mean()
+    return obstacle_loss
+
+def compute_L_control(u: torch.Tensor, u_min: torch.Tensor, u_max: torch.Tensor) -> torch.Tensor:
+    """
+    u: 模型输出的控制输入 [batch, T, m]
+    u_min: 控制输入下限（如电机最小扭矩） [m]
+    u_max: 控制输入上限（如电机最大扭矩） [m]
+    返回：控制约束损失
+    """
+    # 扩展u_min/u_max到批量时序维度
+    u_min_expand = u_min.unsqueeze(0).unsqueeze(0).expand(u.shape[0], u.shape[1], -1)  # [batch, T, m]
+    u_max_expand = u_max.unsqueeze(0).unsqueeze(0).expand(u.shape[0], u.shape[1], -1)  # [batch, T, m]
+    
+    # 惩罚超出下限的部分：max(0, u_min - u)
+    loss_min = torch.max(torch.tensor(0.0, device=u.device), u_min_expand - u).mean()
+    # 惩罚超出上限的部分：max(0, u - u_max)
+    loss_max = torch.max(torch.tensor(0.0, device=u.device), u - u_max_expand).mean()
+    
+    return loss_min + loss_max

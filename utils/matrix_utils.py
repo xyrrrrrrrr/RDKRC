@@ -82,9 +82,10 @@ def update_A_B(
     B_normalized = B_avg / global_norm
 
     # 6. 平滑更新（Section II.28训练稳定性要求：避免A、B剧烈波动）
-    alpha = 0.1  # 当前计算值权重（文档未指定，取小值确保平滑）
+    alpha = 0.5  # 当前计算值权重（文档未指定，取小值确保平滑）
     A = (1 - alpha) * A_init.detach() + alpha * A_normalized
     B = (1 - alpha) * B_init.detach() + alpha * B_normalized
+
 
     return A, B
 
