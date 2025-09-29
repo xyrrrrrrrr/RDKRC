@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import argparse
 import matplotlib.pyplot as plt
 from typing import Dict, Tuple, Optional
 import warnings
@@ -352,6 +353,8 @@ if __name__ == "__main__":
     # psi_v1 = PsiMLP(...)  # 加载 v1 的 Psi 网络
     # psi_v2 = PsiMLP(...)  # 加载 v2 的 Psi 网络
     # main(seed=2, data_dir="./abc_files", psi_v1=psi_v1, psi_v2=psi_v2)
-    
+    parser = argparse.ArgumentParser(description="Compare DKRC A/B/C Matrices between v1 and v2")
+    parser.add_argument("--seed", type=int, default=2, help="Random seed used in training (default: 2)")
+    args = parser.parse_args()
     # 若无 Psi 网络，仅对比 A/B/C 的基础指标
-    main(seed=50, data_dir=".")  # data_dir 为 A/B/C 文件所在目录
+    main(seed=args.seed, data_dir=".")  # data_dir 为 A/B/C 文件所在目录

@@ -146,11 +146,12 @@ def compute_total_loss(
     
     # 2. 计算L2损失（调用`compute_L2_loss`，支持额外超参数）
     L2 = compute_L2_loss(A, B, **kwargs)
-    
+ 
     # 3. 计算总损失（文档Algorithm 1步骤4）
     total_loss = lambda_L1 * L1 + lambda_L2 * L2
         
     return total_loss, L1, L2
+
 
 def compute_L_track(z_fused: torch.Tensor, z_ref: torch.Tensor) -> torch.Tensor:
     """
