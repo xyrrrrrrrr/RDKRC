@@ -1,8 +1,9 @@
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from typing import Tuple
 from rdkrc.utils.matrix_utils import compute_controllability_matrix
-
+from rdkrc.utils.data_utils import compute_knn_neighbors
 
 def compute_L1_loss(
     z_prev: torch.Tensor,
@@ -152,6 +153,73 @@ def compute_total_loss(
         
     return total_loss, L1, L2
 
+# 修改后的ManifoldEmbLoss类示例（需替换你原有代码）
+class ManifoldEmbLoss(nn.Module):
+    def __init__(self, k=10):
+        super().__init__()
+        self.k = k  # K近邻数量
+        self.neighbor_indices = None  # 不再预存全局索引，改为batch内临时存储
+
+    def compute_knn(self, X):
+        """针对单个batch的X，计算每个样本的K近邻索引（仅在当前batch内）"""
+        # 计算X的 pairwise 距离（欧氏距离）
+        n = X.shape[0]
+        dist_matrix = torch.cdist(X, X, p=2)  # shape=[n, n]
+        # 取每个样本的前k+1个近邻（排除自身，所以k+1），再去掉第0个（自身）
+        _, indices = torch.topk(dist_matrix, k=self.k+1, largest=False, dim=1)
+        self.neighbor_indices = indices[:, 1:]  # shape=[n, k]，每个样本的k个邻居索引
+        return self.neighbor_indices
+
+    def forward(self, z, X):
+        """
+        z: 当前batch的嵌入张量，shape=[batch*T, manifold_dim]
+        X: 当前batch的原状态张量，shape=[batch*T, x_dim]
+        """
+        # 第一步：针对当前batch的X，动态计算K近邻索引
+        self.compute_knn(X)
+        # 第二步：根据邻居索引，提取z和X的邻居样本
+        n = z.shape[0]
+        # 确保索引在合法范围内（双重保险）
+        self.neighbor_indices = torch.clamp(self.neighbor_indices, 0, n-1)
+        
+        # 提取每个样本的邻居（shape=[n, k, dim]）
+        z_neighbors = z[self.neighbor_indices]  # [n, k, manifold_dim]
+        x_neighbors = X[self.neighbor_indices]  # [n, k, x_dim]
+        
+        # 计算原状态与邻居的距离、嵌入后与邻居的距离
+        x_dist = torch.cdist(X.unsqueeze(1), x_neighbors, p=2).squeeze(1)  # [n, k]
+        z_dist = torch.cdist(z.unsqueeze(1), z_neighbors, p=2).squeeze(1)  # [n, k]
+        
+        # 计算流形损失（原逻辑不变）
+        loss = torch.mean(torch.abs(z_dist - x_dist))
+        return loss
+    
+class ManifoldCtrlLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mse_loss = nn.MSELoss()
+
+    def forward(self, A: nn.Linear, B: nn.Linear, z_t: torch.Tensor, z_t1: torch.Tensor, g_phi: torch.Tensor) -> torch.Tensor:
+        """
+        计算线性演化一致性损失
+        A, B: Koopman算子（nn.Linear层，无偏置）
+        z_t: t时刻嵌入向量 [batch, n+d]
+        z_t1: t+1时刻嵌入向量 [batch, n+d]
+        g_phi: 控制网络输出 [batch, m]（m为控制维度）
+        """
+        # 计算理论控制嵌入：g_phi_theo = B^+ (z_t1 - A z_t)
+        A_z_t = A(z_t)  # [batch, n+d]
+        z_diff = z_t1 - A_z_t  # [batch, n+d]
+        
+        # 计算B的伪逆（B.weight: [n+d, m]）
+        B_weight = B.weight  # [out_dim= n+d, in_dim= m]
+        B_pinv = torch.linalg.pinv(B_weight)  # [m, n+d]
+        
+        # 理论控制嵌入：[batch, m] = [batch, n+d] @ [n+d, m]
+        g_phi_theo = z_diff @ B_pinv.T
+        
+        # 一致性损失
+        return self.mse_loss(g_phi, g_phi_theo)
 
 def compute_L_track(z_fused: torch.Tensor, z_ref: torch.Tensor) -> torch.Tensor:
     """

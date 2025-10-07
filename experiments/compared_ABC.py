@@ -7,12 +7,12 @@ import warnings
 warnings.filterwarnings("ignore")  # 忽略数值计算中的警告
 
 
-def load_abc_matrix(version: str, seed: int = 50, data_dir: str = ".") -> Dict[str, np.ndarray]:
+def load_abc_matrix(version: str, seed: int = 50, data_dir: str = "data") -> Dict[str, np.ndarray]:
     """
     读取指定版本和种子的 A、B、C 矩阵（适配用户的 npz 文件名格式）
     
     Args:
-        version: 模型版本（如 "v1"、"v2"）
+        version: 模型版本（如 "v1"、"v2"、"v3"）
         seed: 随机种子（与保存时一致，默认2）
         data_dir: 文件所在目录（默认当前目录）
     
@@ -127,22 +127,27 @@ def compute_abc_metrics(abc_dict: Dict[str, np.ndarray], psi: Optional["PsiMLP"]
     return metrics
 
 
-def plot_abc_comparison(v1_abc: Dict[str, np.ndarray], v2_abc: Dict[str, np.ndarray], v1_metrics: Dict[str, float], v2_metrics: Dict[str, float]):
+def plot_abc_comparison(ver1_abc: Dict[str, np.ndarray], ver2_abc: Dict[str, np.ndarray], 
+                        ver1_metrics: Dict[str, float], ver2_metrics: Dict[str, float],
+                        ver1_name: str, ver2_name: str):
     """
-    可视化对比 v1 和 v2 的 A、B、C 矩阵关键指标（贴合文档关注重点）
+    可视化对比两个指定版本的 A、B、C 矩阵关键指标（贴合文档关注重点）
     """
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle("DKRC A/B/C Matrix Comparison (v1 vs v2)", fontsize=16, fontweight="bold")
-    colors = ["#1f77b4", "#ff7f0e"]  # v1蓝，v2橙
+    # 动态设置标题（显示用户指定的两个版本）
+    fig.suptitle(f"DKRC A/B/C Matrix Comparison ({ver1_name} vs {ver2_name})", fontsize=16, fontweight="bold")
+    colors = ["#1f77b4", "#ff7f0e"]  # 第一个版本蓝，第二个版本橙
 
     # -------------------------- 子图1：A矩阵特征值分布（稳定性核心指标） --------------------------
     ax1 = axes[0, 0]
     # 计算特征值
-    v1_eig = np.linalg.eigvals(v1_abc["A"])
-    v2_eig = np.linalg.eigvals(v2_abc["A"])
+    ver1_eig = np.linalg.eigvals(ver1_abc["A"])
+    ver2_eig = np.linalg.eigvals(ver2_abc["A"])
     # 绘制特征值散点（实部vs虚部）
-    ax1.scatter(np.real(v1_eig), np.imag(v1_eig), color=colors[0], alpha=0.6, label=f"v1 (max_norm={v1_metrics['A_max_eig_norm']:.3f})")
-    ax1.scatter(np.real(v2_eig), np.imag(v2_eig), color=colors[1], alpha=0.6, label=f"v2 (max_norm={v2_metrics['A_max_eig_norm']:.3f})")
+    ax1.scatter(np.real(ver1_eig), np.imag(ver1_eig), color=colors[0], alpha=0.6, 
+                label=f"{ver1_name} (max_norm={ver1_metrics['A_max_eig_norm']:.3f})")
+    ax1.scatter(np.real(ver2_eig), np.imag(ver2_eig), color=colors[1], alpha=0.6, 
+                label=f"{ver2_name} (max_norm={ver2_metrics['A_max_eig_norm']:.3f})")
     # 绘制单位圆（稳定性边界：离散系统特征值需在圆内）
     theta = np.linspace(0, 2*np.pi, 100)
     ax1.plot(np.cos(theta), np.sin(theta), "k--", alpha=0.5, label="Unit Circle (Stability Boundary)")
@@ -161,25 +166,25 @@ def plot_abc_comparison(v1_abc: Dict[str, np.ndarray], v2_abc: Dict[str, np.ndar
         "B Controllability Rank\n(Ratio, 1 is full rank)",
         "B Mean Column Norm\n(Control Strength)"
     ]
-    v1_vals = [
-        v1_metrics["A_max_eig_norm"],
-        v1_metrics["A_mean_eig_norm"],
-        v1_metrics["B_ctrl_rank_ratio"],
-        v1_metrics["B_mean_col_norm"]
+    ver1_vals = [
+        ver1_metrics["A_max_eig_norm"],
+        ver1_metrics["A_mean_eig_norm"],
+        ver1_metrics["B_ctrl_rank_ratio"],
+        ver1_metrics["B_mean_col_norm"]
     ]
-    v2_vals = [
-        v2_metrics["A_max_eig_norm"],
-        v2_metrics["A_mean_eig_norm"],
-        v2_metrics["B_ctrl_rank_ratio"],
-        v2_metrics["B_mean_col_norm"]
+    ver2_vals = [
+        ver2_metrics["A_max_eig_norm"],
+        ver2_metrics["A_mean_eig_norm"],
+        ver2_metrics["B_ctrl_rank_ratio"],
+        ver2_metrics["B_mean_col_norm"]
     ]
     # 绘制柱状图
     x = np.arange(len(metrics_names))
     width = 0.35
-    ax2.bar(x - width/2, v1_vals, width, color=colors[0], label="v1")
-    ax2.bar(x + width/2, v2_vals, width, color=colors[1], label="v2")
+    ax2.bar(x - width/2, ver1_vals, width, color=colors[0], label=ver1_name)
+    ax2.bar(x + width/2, ver2_vals, width, color=colors[1], label=ver2_name)
     # 添加数值标签
-    for i, (v1, v2) in enumerate(zip(v1_vals, v2_vals)):
+    for i, (v1, v2) in enumerate(zip(ver1_vals, ver2_vals)):
         ax2.text(i - width/2, v1 + 0.01, f"{v1:.3f}", ha="center", fontsize=10)
         ax2.text(i + width/2, v2 + 0.01, f"{v2:.3f}", ha="center", fontsize=10)
     ax2.set_xlabel("Key Metrics", fontsize=12)
@@ -192,26 +197,29 @@ def plot_abc_comparison(v1_abc: Dict[str, np.ndarray], v2_abc: Dict[str, np.ndar
 
     # -------------------------- 子图3：C矩阵状态重构误差对比（若有数据） --------------------------
     ax3 = axes[1, 0]
-    if "C_mean_recon_error" in v1_metrics and "C_mean_recon_error" in v2_metrics:
+    if "C_mean_recon_error" in ver1_metrics and "C_mean_recon_error" in ver2_metrics:
         # 重构误差箱线图
         recon_data = [
-            np.random.normal(v1_metrics["C_mean_recon_error"], v1_metrics["C_recon_error_std"], 100),
-            np.random.normal(v2_metrics["C_mean_recon_error"], v2_metrics["C_recon_error_std"], 100)
+            np.random.normal(ver1_metrics["C_mean_recon_error"], ver1_metrics["C_recon_error_std"], 100),
+            np.random.normal(ver2_metrics["C_mean_recon_error"], ver2_metrics["C_recon_error_std"], 100)
         ]
-        bp = ax3.boxplot(recon_data, labels=["v1", "v2"], patch_artist=True)
+        bp = ax3.boxplot(recon_data, labels=[ver1_name, ver2_name], patch_artist=True)
         for patch, color in zip(bp["boxes"], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.6)
         # 添加均值线
-        ax3.axhline(y=v1_metrics["C_mean_recon_error"], color=colors[0], linestyle="--", alpha=0.8, label=f"v1 Mean: {v1_metrics['C_mean_recon_error']:.3f}")
-        ax3.axhline(y=v2_metrics["C_mean_recon_error"], color=colors[1], linestyle="--", alpha=0.8, label=f"v2 Mean: {v2_metrics['C_mean_recon_error']:.3f}")
+        ax3.axhline(y=ver1_metrics["C_mean_recon_error"], color=colors[0], linestyle="--", alpha=0.8, 
+                    label=f"{ver1_name} Mean: {ver1_metrics['C_mean_recon_error']:.3f}")
+        ax3.axhline(y=ver2_metrics["C_mean_recon_error"], color=colors[1], linestyle="--", alpha=0.8, 
+                    label=f"{ver2_name} Mean: {ver2_metrics['C_mean_recon_error']:.3f}")
         ax3.set_xlabel("Model Version", fontsize=12)
         ax3.set_ylabel("State Reconstruction Error (L2 Norm)", fontsize=12)
         ax3.set_title("C Matrix State Reconstruction Error", fontsize=14)
         ax3.legend()
         ax3.grid(True, alpha=0.3, axis="y")
     else:
-        ax3.text(0.5, 0.5, "Need PsiMLP to Compute Reconstruction Error", ha="center", va="center", transform=ax3.transAxes, fontsize=12)
+        ax3.text(0.5, 0.5, "Need PsiMLP to Compute Reconstruction Error", ha="center", va="center", 
+                 transform=ax3.transAxes, fontsize=12)
         ax3.set_xlabel("Model Version", fontsize=12)
         ax3.set_ylabel("Reconstruction Error", fontsize=12)
         ax3.set_title("C Matrix State Reconstruction Error (No Data)", fontsize=14)
@@ -220,22 +228,22 @@ def plot_abc_comparison(v1_abc: Dict[str, np.ndarray], v2_abc: Dict[str, np.ndar
     ax4 = axes[1, 1]
     # 矩阵范数指标（Frobenius 范数，数值稳定性）
     norm_names = ["A Norm", "B Norm", "C Norm"]
-    v1_norms = [
-        v1_metrics["A_fro_norm"],
-        np.linalg.norm(v1_abc["B"], ord="fro"),
-        v1_metrics["C_fro_norm"]
+    ver1_norms = [
+        ver1_metrics["A_fro_norm"],
+        np.linalg.norm(ver1_abc["B"], ord="fro"),
+        ver1_metrics["C_fro_norm"]
     ]
-    v2_norms = [
-        v2_metrics["A_fro_norm"],
-        np.linalg.norm(v2_abc["B"], ord="fro"),
-        v2_metrics["C_fro_norm"]
+    ver2_norms = [
+        ver2_metrics["A_fro_norm"],
+        np.linalg.norm(ver2_abc["B"], ord="fro"),
+        ver2_metrics["C_fro_norm"]
     ]
     # 绘制堆叠柱状图
     x = np.arange(len(norm_names))
-    ax4.bar(x - width/2, v1_norms, width, color=colors[0], label="v1")
-    ax4.bar(x + width/2, v2_norms, width, color=colors[1], label="v2")
+    ax4.bar(x - width/2, ver1_norms, width, color=colors[0], label=ver1_name)
+    ax4.bar(x + width/2, ver2_norms, width, color=colors[1], label=ver2_name)
     # 添加数值标签
-    for i, (v1, v2) in enumerate(zip(v1_norms, v2_norms)):
+    for i, (v1, v2) in enumerate(zip(ver1_norms, ver2_norms)):
         ax4.text(i - width/2, v1 + 0.5, f"{v1:.1f}", ha="center", fontsize=10)
         ax4.text(i + width/2, v2 + 0.5, f"{v2:.1f}", ha="center", fontsize=10)
     ax4.set_xlabel("Matrix Type", fontsize=12)
@@ -246,33 +254,35 @@ def plot_abc_comparison(v1_abc: Dict[str, np.ndarray], v2_abc: Dict[str, np.ndar
     ax4.legend()
     ax4.grid(True, alpha=0.3, axis="y")
 
-    # 保存图片（符合文档实验结果保存要求，🔶1-87）
+    # 动态命名保存图片（包含两个版本，避免覆盖）
     plt.tight_layout()
-    plt.savefig("lunar_lander_abc_comparison_v1_vs_v2.png", dpi=300, bbox_inches="tight")
+    save_path = f"./fig/lunar_lander_abc_comparison_{ver1_name}_vs_{ver2_name}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print("\nA/B/C 对比图表已保存为：lunar_lander_abc_comparison_v1_vs_v2.png")
+    print(f"\nA/B/C 对比图表已保存为：{save_path}")
 
 
-def main(seed: int = 2, data_dir: str = ".", psi_v1: Optional["PsiMLP"] = None, psi_v2: Optional["PsiMLP"] = None):
+def main(ver1_name: str, ver2_name: str, seed: int = 2, data_dir: str = ".", 
+         psi_ver1: Optional["PsiMLP"] = None, psi_ver2: Optional["PsiMLP"] = None):
     """
-    主函数：读取 v1/v2 的 A/B/C，计算指标，对比并可视化
+    主函数：读取用户指定的两个版本的 A/B/C，计算指标，对比并可视化
     """
-    # 1. 读取 v1 和 v2 的 A/B/C 矩阵
-    v1_abc = load_abc_matrix(version="v1", seed=seed, data_dir=data_dir)
-    v2_abc = load_abc_matrix(version="v2", seed=seed, data_dir=data_dir)
+    # 1. 读取两个指定版本的 A/B/C 矩阵
+    ver1_abc = load_abc_matrix(version=ver1_name, seed=seed, data_dir=data_dir)
+    ver2_abc = load_abc_matrix(version=ver2_name, seed=seed, data_dir=data_dir)
 
     # 2. 计算关键指标（若有 Psi 网络，可传入计算重构误差）
     x_star = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 目标状态（文档 IV.D 节）
-    v1_metrics = compute_abc_metrics(v1_abc, psi=psi_v1, x_star=x_star)
-    v2_metrics = compute_abc_metrics(v2_abc, psi=psi_v2, x_star=x_star)
+    ver1_metrics = compute_abc_metrics(ver1_abc, psi=psi_ver1, x_star=x_star)
+    ver2_metrics = compute_abc_metrics(ver2_abc, psi=psi_ver2, x_star=x_star)
 
-    # 3. 打印量化对比结果（贴合文档评估框架）
+    # 3. 打印量化对比结果（动态显示版本名）
     print("\n" + "="*80)
-    print("DKRC A/B/C Matrix Quantitative Comparison (v1 vs v2)")
+    print(f"DKRC A/B/C Matrix Quantitative Comparison ({ver1_name} vs {ver2_name})")
     print("="*80)
     # 按矩阵分类打印
-    print("\n【1. A Matrix (Stability)】")
-    print(f"{'Metric':<30} {'v1':<12} {'v2':<12} {'Better Version':<10}")
+    print(f"\n【1. A Matrix (Stability)】")
+    print(f"{'Metric':<30} {ver1_name:<12} {ver2_name:<12} {'Better Version':<10}")
     print("-"*64)
     metrics_a = [
         ("Max Eigen Norm (<1 is stable)", "A_max_eig_norm"),
@@ -281,13 +291,13 @@ def main(seed: int = 2, data_dir: str = ".", psi_v1: Optional["PsiMLP"] = None, 
         ("Frobenius Norm (numerical scale)", "A_fro_norm")
     ]
     for name, key in metrics_a:
-        v1_val = v1_metrics[key]
-        v2_val = v2_metrics[key]
-        better = "v1" if v1_val < v2_val else "v2"
-        print(f"{name:<30} {v1_val:<12.4f} {v2_val:<12.4f} {better:<10}")
+        ver1_val = ver1_metrics[key]
+        ver2_val = ver2_metrics[key]
+        better = ver1_name if ver1_val < ver2_val else ver2_name
+        print(f"{name:<30} {ver1_val:<12.4f} {ver2_val:<12.4f} {better:<10}")
 
-    print("\n【2. B Matrix (Controllability)】")
-    print(f"{'Metric':<30} {'v1':<12} {'v2':<12} {'Better Version':<10}")
+    print(f"\n【2. B Matrix (Controllability)】")
+    print(f"{'Metric':<30} {ver1_name:<12} {ver2_name:<12} {'Better Version':<10}")
     print("-"*64)
     metrics_b = [
         ("Controllability Rank (full=N)", "B_ctrl_rank"),
@@ -296,14 +306,15 @@ def main(seed: int = 2, data_dir: str = ".", psi_v1: Optional["PsiMLP"] = None, 
         ("Max Column Norm (max control impact)", "B_max_col_norm")
     ]
     for name, key in metrics_b:
-        v1_val = v1_metrics[key]
-        v2_val = v2_metrics[key]
-        better = "v1" if (key == "B_ctrl_rank_ratio" and v1_val > v2_val) else ("v2" if v1_val < v2_val else "v1")
-        print(f"{name:<30} {v1_val:<12.4f} {v2_val:<12.4f} {better:<10}")
+        ver1_val = ver1_metrics[key]
+        ver2_val = ver2_metrics[key]
+        # 能控性秩占比越大越好，其他指标越小越好
+        better = ver1_name if (key == "B_ctrl_rank_ratio" and ver1_val > ver2_val) else (ver2_name if ver1_val < ver2_val else ver1_name)
+        print(f"{name:<30} {ver1_val:<12.4f} {ver2_val:<12.4f} {better:<10}")
 
-    if "C_mean_recon_error" in v1_metrics and "C_mean_recon_error" in v2_metrics:
-        print("\n【3. C Matrix (Reconstruction)】")
-        print(f"{'Metric':<30} {'v1':<12} {'v2':<12} {'Better Version':<10}")
+    if "C_mean_recon_error" in ver1_metrics and "C_mean_recon_error" in ver2_metrics:
+        print(f"\n【3. C Matrix (Reconstruction)】")
+        print(f"{'Metric':<30} {ver1_name:<12} {ver2_name:<12} {'Better Version':<10}")
         print("-"*64)
         metrics_c = [
             ("Mean Reconstruction Error (accuracy)", "C_mean_recon_error"),
@@ -312,49 +323,56 @@ def main(seed: int = 2, data_dir: str = ".", psi_v1: Optional["PsiMLP"] = None, 
             ("Frobenius Norm (numerical scale)", "C_fro_norm")
         ]
         for name, key in metrics_c:
-            v1_val = v1_metrics[key]
-            v2_val = v2_metrics[key]
-            better = "v1" if v1_val < v2_val else "v2"
-            print(f"{name:<30} {v1_val:<12.4f} {v2_val:<12.4f} {better:<10}")
+            ver1_val = ver1_metrics[key]
+            ver2_val = ver2_metrics[key]
+            better = ver1_name if ver1_val < ver2_val else ver2_name
+            print(f"{name:<30} {ver1_val:<12.4f} {ver2_val:<12.4f} {better:<10}")
 
-    # 4. 可视化对比
-    plot_abc_comparison(v1_abc, v2_abc, v1_metrics, v2_metrics)
+    # 4. 可视化对比（传入版本名，动态生成图表）
+    plot_abc_comparison(ver1_abc, ver2_abc, ver1_metrics, ver2_metrics, ver1_name, ver2_name)
 
-    # 5. 总结关键结论（基于文档控制逻辑）
+    # 5. 总结关键结论（动态适配版本名）
     print("\n" + "="*80)
-    print("Key Conclusion (Based on DKRC Control Logic)")
+    print(f"Key Conclusion (Based on DKRC Control Logic)")
     print("="*80)
     # 稳定性结论
-    if v1_metrics["A_max_eig_norm"] < 1 and v2_metrics["A_max_eig_norm"] >= 1:
-        print("❌ v2 A matrix is UNSTABLE (max eigen norm ≥1) → LQR control may oscillate")
-    elif v1_metrics["A_max_eig_norm"] >= 1 and v2_metrics["A_max_eig_norm"] < 1:
-        print("✅ v2 A matrix is MORE STABLE (max eigen norm <1) → Better control stability")
+    if ver1_metrics["A_max_eig_norm"] < 1 and ver2_metrics["A_max_eig_norm"] >= 1:
+        print(f"❌ {ver2_name} A matrix is UNSTABLE (max eigen norm ≥1) → LQR control may oscillate")
+    elif ver1_metrics["A_max_eig_norm"] >= 1 and ver2_metrics["A_max_eig_norm"] < 1:
+        print(f"✅ {ver2_name} A matrix is MORE STABLE (max eigen norm <1) → Better control stability")
     else:
-        print(f"⚠️ Both A matrices are {'stable' if v1_metrics['A_max_eig_norm'] <1 else 'unstable'} (v1: {v1_metrics['A_max_eig_norm']:.3f}, v2: {v2_metrics['A_max_eig_norm']:.3f})")
+        stable_flag = "stable" if ver1_metrics["A_max_eig_norm"] <1 else "unstable"
+        print(f"⚠️ Both A matrices are {stable_flag} ({ver1_name}: {ver1_metrics['A_max_eig_norm']:.3f}, {ver2_name}: {ver2_metrics['A_max_eig_norm']:.3f})")
     # 能控性结论
-    if v1_metrics["B_ctrl_rank_ratio"] == 1 and v2_metrics["B_ctrl_rank_ratio"] < 1:
-        print("❌ v2 B matrix has INSUFFICIENT CONTROLLABILITY → LQR cannot design effective gain")
-    elif v1_metrics["B_ctrl_rank_ratio"] < 1 and v2_metrics["B_ctrl_rank_ratio"] == 1:
-        print("✅ v2 B matrix is FULLY CONTROLLABLE → Better LQR control performance")
+    if ver1_metrics["B_ctrl_rank_ratio"] == 1 and ver2_metrics["B_ctrl_rank_ratio"] < 1:
+        print(f"❌ {ver2_name} B matrix has INSUFFICIENT CONTROLLABILITY → LQR cannot design effective gain")
+    elif ver1_metrics["B_ctrl_rank_ratio"] < 1 and ver2_metrics["B_ctrl_rank_ratio"] == 1:
+        print(f"✅ {ver2_name} B matrix is FULLY CONTROLLABLE → Better LQR control performance")
     else:
-        print(f"⚠️ Controllability: v1 ratio={v1_metrics['B_ctrl_rank_ratio']:.3f}, v2 ratio={v2_metrics['B_ctrl_rank_ratio']:.3f} (1.0 is full rank)")
+        print(f"⚠️ Controllability: {ver1_name} ratio={ver1_metrics['B_ctrl_rank_ratio']:.3f}, {ver2_name} ratio={ver2_metrics['B_ctrl_rank_ratio']:.3f} (1.0 is full rank)")
     # 重构精度结论（若有数据）
-    if "C_mean_recon_error" in v1_metrics:
-        if v2_metrics["C_mean_recon_error"] < v1_metrics["C_mean_recon_error"]:
-            print("✅ v2 C matrix has BETTER RECONSTRUCTION ACCURACY → More accurate state observation")
+    if "C_mean_recon_error" in ver1_metrics:
+        if ver2_metrics["C_mean_recon_error"] < ver1_metrics["C_mean_recon_error"]:
+            print(f"✅ {ver2_name} C matrix has BETTER RECONSTRUCTION ACCURACY → More accurate state observation")
         else:
-            print("❌ v2 C matrix has WORSE RECONSTRUCTION ACCURACY → Less accurate state observation")
+            print(f"❌ {ver2_name} C matrix has WORSE RECONSTRUCTION ACCURACY → Less accurate state observation")
 
 
-# 调用示例（需根据实际环境调整）
+# 调用示例（支持命令行指定任意两个版本）
 if __name__ == "__main__":
-    # 若需要计算 C 矩阵的重构误差，需传入训练好的 PsiMLP 网络（可选）
-    # from rdkrc.models.psi_mlp import PsiMLP
-    # psi_v1 = PsiMLP(...)  # 加载 v1 的 Psi 网络
-    # psi_v2 = PsiMLP(...)  # 加载 v2 的 Psi 网络
-    # main(seed=2, data_dir="./abc_files", psi_v1=psi_v1, psi_v2=psi_v2)
-    parser = argparse.ArgumentParser(description="Compare DKRC A/B/C Matrices between v1 and v2")
+    # 新增命令行参数：--version1 和 --version2，支持用户指定对比版本
+    parser = argparse.ArgumentParser(description="Compare DKRC A/B/C Matrices between Two Versions")
+    parser.add_argument("--ver1", type=str, default="v1", help="First version to compare (e.g., v1, v2)")
+    parser.add_argument("--ver2", type=str, default="v2", help="Second version to compare (e.g., v2, v3)")
     parser.add_argument("--seed", type=int, default=2, help="Random seed used in training (default: 2)")
+    parser.add_argument("--data_dir", type=str, default="data", help="Directory of A/B/C npz files (default: current dir)")
     args = parser.parse_args()
+
+    # 若需要计算 C 矩阵的重构误差，需传入对应版本的 PsiMLP 网络（可选）
+    # from rdkrc.models.psi_mlp import PsiMLP
+    # psi_ver1 = PsiMLP(...)  # 加载第一个版本的 Psi 网络
+    # psi_ver2 = PsiMLP(...)  # 加载第二个版本的 Psi 网络
+    # main(ver1_name=args.version1, ver2_name=args.version2, seed=args.seed, data_dir=args.data_dir, psi_ver1=psi_ver1, psi_ver2=psi_ver2)
+
     # 若无 Psi 网络，仅对比 A/B/C 的基础指标
-    main(seed=args.seed, data_dir=".")  # data_dir 为 A/B/C 文件所在目录
+    main(ver1_name=args.ver1, ver2_name=args.ver2, seed=args.seed, data_dir=args.data_dir)

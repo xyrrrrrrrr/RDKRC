@@ -1,16 +1,19 @@
 import torch
+import os
 import gym
 import torch.optim as optim
 import numpy as np
 import argparse
 import math
+import torch.nn as nn
 import matplotlib.pyplot as plt
 from tqdm import trange
 from typing import Tuple, List
 from torch.utils.data import TensorDataset, DataLoader
-from rdkrc.utils.data_utils import generate_lunar_lander_data
+from rdkrc.utils.data_utils import generate_lunar_lander_data_ksteps
 from rdkrc.models.psi_mlp import PsiMLP, PsiMLP_v2, PsiMLP_v3
-from rdkrc.trainer.loss_functions import compute_total_loss
+from rdkrc.models.MCDKN import DKN_MC
+from rdkrc.trainer.loss_functions import compute_total_loss, ManifoldCtrlLoss, ManifoldEmbLoss
 from rdkrc.utils.matrix_utils import compute_C_matrix, update_A_B
 from rdkrc.controller.lqr_controller import solve_discrete_lqr, solve_discrete_lqr_v2
 from rdkrc.controller.mpc_controller import DKRCMPCController
@@ -22,7 +25,7 @@ def test_lander_lqr(
     x_star: torch.Tensor,
     num_episodes: int = 10,
     max_steps: int = 500,
-    version: str = "v1",
+    version: str = "MCDKN",
     seed: int = 2
 ) -> List[float]:
     """
@@ -48,7 +51,6 @@ def test_lander_lqr(
     all_trajectories: List[List[Tuple[float, float]]] = []  # 存储所有episode的x-y轨迹（文档核心位置维度，🔶1-80）
     landing_positions: List[Tuple[float, float]] = []  # 新增：存储所有episode的落地位置（最终x-y坐标）
     success_count = 0  # 成功着陆计数（文档IV.D节隐含评估标准：x∈[-0.5,0.5]且y∈[0,0.1]）
-
     psi.eval()  # 推理模式（禁用梯度，文档测试阶段要求，🔶1-28）
     with torch.no_grad():
         for ep in range(num_episodes):
@@ -63,18 +65,17 @@ def test_lander_lqr(
             while not done and step < max_steps:
                 # 记录当前位置（仅保留文档关注的x-y维度，🔶1-80、🔶1-87）
                 trajectory.append((x_prev[0], x_prev[1]))
-
                 # 1. 计算高维线性状态z（文档Equation 4：z=Ψ(x)-Ψ(x*)，核心线性化步骤）
-                x_prev_tensor = torch.tensor(x_prev, device=device, dtype=torch.float32).unsqueeze(0)
-                z_prev = psi.compute_z(x_prev_tensor, x_star)
+                x_prev_tensor = torch.tensor(x_prev, device=device, dtype=torch.float32)
+                z_prev = psi.embed(x_prev_tensor) - psi.embed(x_star)
                 z_prev_np = z_prev.cpu().detach().numpy()
 
                 # 2. 计算LQR控制输入（文档III节：v_t=-K_lqr z_t，u_t=v_t+u₀，控制律设计）
-                v_t = -K_lqr @ z_prev_np.T  # 变换后控制输入（适配高维线性模型）
-                u0 = psi.forward_u0(x_prev_tensor).cpu().detach().numpy().squeeze()  # 文档II.36节u₀补偿（控制固定点）
-                u_t = v_t.squeeze() + u0
+                u_t_ = -K_lqr @ z_prev_np.T  # 变换后控制输入（适配高维线性模型）
+                u_t_ = torch.tensor(u_t_.T, device=device, dtype=torch.float32)
+                # u_t = psi.decode_control(u_t_)[6: ].cpu().detach().numpy()
+                u_t = psi.forward_inv_control(x_prev_tensor, u_t_).squeeze(0).cpu().detach().numpy()
                 u_t = np.clip(u_t, env.action_space.low, env.action_space.high)  # 文档隐含控制约束（物理执行器限制）
-
                 # 3. 环境交互（文档IV.D节：获取下一状态与奖励，完成状态迭代）
                 x_next, reward, done, _ = env.step(u_t)
                 total_score += reward
@@ -357,343 +358,301 @@ def test_lander_mpc(
 
     return episode_scores
 
-def train_psi_lander(
-    x_prev: np.ndarray,
-    u_prev: np.ndarray,
-    x_next: np.ndarray,
-    z_dim: int = 12,
-    epochs: int = 500,
+def train_mc_dkn(
+    X_train: torch.Tensor,  # [N, T, x_dim]
+    U_train: torch.Tensor,  # [N, T, u_dim]
     batch_size: int = 128,
-    lr: float = 1e-4,
-    version: str = "v1"
-) -> Tuple[torch.nn.Module, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    训练月球着陆器的PsiMLP网络（文档Algorithm 1完整流程）
-    核心修正：补充\(u_0\)调用、纠正A/B初始化、用全部数据计算最终A/B/C、适配DataLoader批量逻辑。
-    
-    Args:
-        x_prev: 原始状态序列，shape=[total_samples,6]（文档IV.D节数据格式）
-        u_prev: 控制输入序列，shape=[total_samples,2]（文档IV.D节控制维度）
-        x_next: 下一状态序列，shape=[total_samples,6]
-        z_dim: 高维线性空间维度N（文档II.28节未指定，默认256）
-        epochs: 训练轮次（文档II.28节未指定，默认500）
-        batch_size: 批量大小（文档II.27节批量训练逻辑，默认128）
-        lr: 学习率（文档II.28节用ADAM优化器，默认1e-4）
-        version: PsiMLP版本选择（"v1"为基础版，"v2"为改进版，默认"v1"）
-    Returns:
-        psi: 训练好的PsiMLP网络（含\(u_0\)）
-        A_final: 收敛后的Koopman矩阵，shape=[256,256]（文档Equation 5）
-        B_final: 收敛后的控制矩阵，shape=[256,2]（文档Equation 5）
-        C_final: 状态重构矩阵，shape=[6,256]（文档Equation 9）
-    """
-    # 1. 设备与环境参数初始化（文档II.28节推荐GPU，获取状态上下界）
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    epochs_stage1: int = 100,
+    epochs_stage2: int = 300,
+    lr: float = 1e-3,
+    neighbors: int = 10,
+    K_steps: int = 15,
+    alpha: float = 0.1,  # 嵌入流形约束权重
+    beta: float = 0.4,   # 控制流形约束权重
+    gamma: float = 0.2,   # 逆映射损失权重
+    version:str = 'v1'
+):
+    env = gym.make("LunarLanderContinuous-v2")
+    action_low = env.action_space.low
+    action_high = env.action_space.high
     state_low = [-2, -2, -5, -5, -math.pi, -5]
     state_high = [2, 2, 5, 5, math.pi, 5]
-    print(f"使用设备：{device}（文档II.28节推荐NVIDIA GPU）")
-
-    # 2. 数据转换与批量加载（文档II.27节数据预处理逻辑）
-    x_prev_tensor = torch.tensor(x_prev, device=device, dtype=torch.float32)
-    u_prev_tensor = torch.tensor(u_prev, device=device, dtype=torch.float32)
-    x_next_tensor = torch.tensor(x_next, device=device, dtype=torch.float32)
-    # 用DataLoader实现批量采样（打乱+分批，避免手动切片误差）
-    dataset = TensorDataset(x_prev_tensor, u_prev_tensor, x_next_tensor)
+    dataset = TensorDataset(X_train, U_train)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    model = DKN_MC(x_dim=args.x_dim, u_dim=args.control_dim,hidden_dim=128,manifold_dim=args.x_dim, state_low=state_low, state_high=state_high, 
+                   action_low=action_low, action_high=action_high, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    # 初始化组件
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    k_step_loss = nn.MSELoss()
+    manifold_emb_loss = ManifoldEmbLoss(k=neighbors)
+    manifold_ctrl_loss = ManifoldCtrlLoss()
+    inv_loss = nn.MSELoss()
+    # 5. 初始化损失记录列表（分阶段存储各项损失）
+    stage1_k_losses: List[float] = []  # 阶段1：仅K-step损失
+    # 阶段2：总损失 + 各子损失
+    stage2_total_losses: List[float] = []
+    stage2_k_losses: List[float] = []
+    stage2_emb_losses: List[float] = []
+    stage2_ctrl_losses: List[float] = []
+    stage2_inv_losses: List[float] = []
+    # -------------------------- 阶段1：基础预训练（无流形约束） --------------------------
+    model.train()
+    print("阶段1：基础预训练（无流形约束）...")
+    for epoch in range(epochs_stage1):
+        total_loss = 0.0
+        actual_num_batches = 0
 
-    # 3. 核心模块初始化（严格匹配文档定义）
-    # 3.1 PsiMLP：输入6维，输出256维（N≫6），控制维度2，传入状态上下界
-    if version == "v1":
-        psi = PsiMLP(
-            input_dim=6,
-            output_dim=z_dim,
-            control_dim=2,
-            low=state_low,
-            high=state_high,
-            hidden_dims=[256, 256, 256, 256]  # 文档II.28节4层隐藏层
-        ).to(device)
-    elif version == "v2":
-        psi = PsiMLP_v2(
-            input_dim=6,
-            output_dim=z_dim,
-            control_dim=2,
-            low=state_low,
-            high=state_high,
-            hidden_dims=[256, 256, 256, 256]  # 文档II.28节4层隐藏层
-        ).to(device)
-    elif version == "v3":
-        state_low = [-2, -2, -5, -5, -1, -5]
-        state_high = [2, 2, 5, 5, 1, 5]
-        psi = PsiMLP_v3(
-            input_dim=6,
-            output_dim=z_dim,
-            control_dim=2,
-            physics_dim=4,
-            low=state_low,
-            high=state_high,
-            hidden_dims=[256, 256, 256, 256]  # 文档II.28节4层隐藏层
-        ).to(device)
-    # 3.2 优化器：ADAM（文档II.28节指定）
-    optimizer = optim.Adam(psi.parameters(), lr=lr)
-    # 3.3 目标状态x*：文档IV.D节定义为着陆区（x=10, y=4，其余状态为0）
-    x_star = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=torch.float32)
-    # 3.4 A/B初始化：随机正态分布（文档II.39节“随机初始化A/B”），避免对角矩阵偏置
-    N = z_dim  # 高维空间维度
-    m = 2      # 控制输入维度
-    A = torch.randn(N, N, device=device)
-    B = torch.randn(N, 2, device=device)
-    # 初始化归一化（避免数值溢出，文档未明说但为训练稳定性必需）
-    A = A / torch.norm(A, dim=0, keepdim=True)
-    B = B / torch.norm(B, dim=0, keepdim=True)
-    avg_loss_list: List[float] = []
-    # 4. 训练循环（文档Algorithm 1步骤1-4）
-    if version != "v3":
-        psi.train()
-        for epoch in range(epochs):
-            total_epoch_loss = 0.0
-            L1_loss = 0.0
-            L2_loss = 0.0
-            for batch in dataloader:
-                x_prev_batch, u_prev_batch, x_next_batch = batch  # [B,6], [B,2], [B,6]
-                
-                # 4.1 计算高维线性状态z（文档Algorithm 1步骤1：z = Ψ(x) - Ψ(x*)）
-                z_prev = psi.compute_z(x_prev_batch, x_star)  # [B,256]
-                z_next = psi.compute_z(x_next_batch, x_star)  # [B,256]
-                
-                # 4.2 获取控制固定点u0（文档II.36节“辅助网络学习u0”，匹配批量大小）
-                u0_batch = psi.forward_u0(x_prev_batch)  # [B,2]
-                
-                # 4.3 更新A/B矩阵（文档Algorithm 1隐含步骤，调用matrix_utils）
-                A, B = update_A_B(z_prev, z_next, u_prev_batch, A, B)
-                
-                # 4.4 计算总损失（文档Algorithm 1步骤4：L(θ) = L1 + L2，加入u_prev和u0）
-                total_loss, L1, L2 = compute_total_loss(
-                    z_prev=z_prev,
-                    z_next=z_next,
-                    A=A,
-                    B=B,
-                    u_prev=u_prev_batch,
-                    u0=u0_batch,
-                    lambda_L1=1,
-                    lambda_L2=0.01  
-                )
-                
-                # 4.5 反向传播与参数更新
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-                
-                total_epoch_loss += total_loss.item() * batch_size  # 累积 epoch 损失
-                L1_loss += L1.item() * batch_size
-                L2_loss += L2.item() * batch_size
-            # 每过20个epoch降低一次学习率
-            if (epoch + 1) % 20 == 0:
-                for param_group in optimizer.param_groups:
+        for batch in dataloader:
+            # 取批次数据
+            batch_X, batch_U = batch
+            # K步预测（k=15，文档V.B节）
+            x0 = batch_X[:, 0, :]  # [batch, x_dim]
+            u_seq = batch_U.permute(1, 0, 2)  # [15, batch, u_dim]
+            x_pred_seq = model.predict_k_steps(x0, u_seq, k=K_steps)  # [16, batch, x_dim]
+            x_pred_seq = x_pred_seq.permute(1, 0, 2)  # [batch, 16, x_dim]
+            
+            # 原K步损失（Eq.14）
+            loss_k = 0.0
+            for i in range(1, K_steps):
+                weight = 0.95 ** (i-1)  # gamma=0.95，文档Eq.14
+                loss_k += weight * k_step_loss(x_pred_seq[:, i, :], batch_X[:, i, :])
+            
+            # 优化
+            optimizer.zero_grad()
+            loss_k.backward()
+            optimizer.step()
+            total_loss += loss_k.item()
+            actual_num_batches += 1
+        # 计算当前epoch平均损失并记录
+        avg_k_loss = total_loss / actual_num_batches
+        stage1_k_losses.append(avg_k_loss)
+
+        if (epoch + 1) % 20 == 0:
+            print(f"Stage1 Epoch {epoch+1:4d} | K-step Loss: {avg_k_loss:.6f}")
+    plot_stage1_losses(stage1_k_losses, version)
+    # -------------------------- 阶段2：流形约束训练 --------------------------
+    print("\n阶段2：流形约束训练...")
+    for epoch in range(epochs_stage2):
+        total_total_loss = 0.0
+        total_k_loss = 0.0
+        total_emb_loss = 0.0
+        total_ctrl_loss = 0.0
+        total_inv_loss = 0.0
+        actual_num_batches = 0
+        
+        for batch in dataloader:
+            batch_X, batch_U = batch  # 直接从dataloader获取batch
+            batch_X = batch_X.to(device)
+            batch_U = batch_U.to(device)
+            batch_size = batch_X.shape[0]
+            
+            # 1. K步预测损失（基础）
+            x0 = batch_X[:, 0, :]
+            u_seq = batch_U.permute(1, 0, 2)
+            x_pred_seq = model.predict_k_steps(x0, u_seq, k=K_steps)
+            x_pred_seq = x_pred_seq.permute(1, 0, 2)
+            loss_k = 0.0
+            for i in range(1, K_steps):
+                weight = 0.95 ** (i-1)
+                loss_k += weight * k_step_loss(x_pred_seq[:, i, :], batch_X[:, i, :])
+            
+            # 2. 嵌入流形约束损失（局部邻域保持）
+            # 取批次内所有状态样本（flat为[N*T, x_dim]）
+            X_batch_flat = batch_X.view(-1, model.x_dim)  # [batch*T, x_dim]
+            z_batch_flat = model.embed(X_batch_flat)  # [batch*T, manifold_dim]
+            loss_emb = manifold_emb_loss(z_batch_flat, X_batch_flat)
+            
+            # 3. 控制流形约束损失（线性演化一致性）
+            # 取t=0到t=T-2的时序对（z_t, z_t1, g_phi_t）
+            z_M_t = model.embed(batch_X[:, :-1, :].reshape(-1, model.x_dim))  # [batch*(T-1), manifold_dim]
+            z_M_t1 = model.embed(batch_X[:, 1:, :].reshape(-1, model.x_dim))  # [batch*(T-1), manifold_dim]
+            g_phi_t = model.forward_control(
+                batch_X[:, :-1, :].reshape(-1, model.x_dim),
+                batch_U[:, :-1, :].reshape(-1, model.u_dim)
+            )  # [batch*(T-1), u_dim]
+            loss_ctrl = manifold_ctrl_loss(model.A, model.B, z_M_t, z_M_t1, g_phi_t)
+            
+            # 4. 逆映射损失
+            u_flat = batch_U.view(-1, model.u_dim)  # [batch*T, u_dim]
+            g_phi_flat = model.forward_control(X_batch_flat, u_flat)  # [batch*T, u_dim]
+            u_recov = model.forward_inv_control(X_batch_flat, g_phi_flat)  # [batch*T, u_dim]
+            loss_inv = inv_loss(u_flat, u_recov)
+            
+            # 总损失
+            loss_total = loss_k + alpha * loss_emb + beta * loss_ctrl + gamma * loss_inv
+            
+            # 优化
+            optimizer.zero_grad()
+            loss_total.backward()
+            optimizer.step()
+            
+            # 累计损失
+            # 累计各项损失与batch数
+            total_total_loss += loss_total.item()
+            total_k_loss += loss_k.item()
+            total_emb_loss += loss_emb.item()
+            total_ctrl_loss += loss_ctrl.item()
+            total_inv_loss += loss_inv.item()
+            actual_num_batches += 1
+        # 计算当前epoch平均损失并记录
+        avg_total_loss = total_total_loss / actual_num_batches
+        avg_k_loss = total_k_loss / actual_num_batches
+        avg_emb_loss = total_emb_loss / actual_num_batches
+        avg_ctrl_loss = total_ctrl_loss / actual_num_batches
+        avg_inv_loss = total_inv_loss / actual_num_batches
+        
+        stage2_total_losses.append(avg_total_loss)
+        stage2_k_losses.append(avg_k_loss)
+        stage2_emb_losses.append(avg_emb_loss)
+        stage2_ctrl_losses.append(avg_ctrl_loss)
+        stage2_inv_losses.append(avg_inv_loss)
+        # 打印进度（每50轮）
+        if (epoch + 1) % 100 == 0:
+            for param_group in optimizer.param_groups:
                     param_group['lr'] *= 0.5
-            # 打印epoch信息（平均损失，便于监控收敛）
-            avg_epoch_loss = total_epoch_loss / len(dataset)
-            L1 = L1_loss / len(dataset)
-            L2 = L2_loss / len(dataset)
-            avg_loss_list.append(avg_epoch_loss)
-            print(f"Epoch [{epoch+1:3d}/{epochs}] | 平均总损失：{avg_epoch_loss:.4f} | L1：{L1:.4f} | L2：{L2:.4f}", end='\r', flush=True)
-        plot_loss_curve(avg_loss_list, version)
-    else:
-        psi.train()
-        for epoch in range(epochs):
-            total_epoch_loss = 0.0
-            L1_loss = 0.0
-            L2_loss = 0.0
-            for batch in dataloader:
-                x_prev_batch, u_prev_batch, x_next_batch = batch  # [B,6], [B,2], [B,6]
-                psi_x_prev, reg_loss, recon_loss = psi.forward_with_recon(x_prev_batch, u_prev_batch)
-                psi_x_next, _ = psi.forward(x_next_batch)  # 仅计算psi_x_next
+        if (epoch + 1) % 50 == 0:
+            print(f"Stage2 Epoch {epoch+1:4d} | Total Loss: {avg_total_loss:.6f} | "
+                  f"K-step: {avg_k_loss:.6f} | Emb: {avg_emb_loss:.6f} | "
+                  f"Ctrl: {avg_ctrl_loss:.6f} | Inv: {avg_inv_loss:.6f}")
+    # 阶段2结束：绘制各项损失对比曲线
+    plot_stage2_losses(
+        total_losses=stage2_total_losses,
+        k_losses=stage2_k_losses,
+        emb_losses=stage2_emb_losses,
+        ctrl_losses=stage2_ctrl_losses,
+        inv_losses=stage2_inv_losses,
+        version=version
+    )
+    return model
 
-                # 3. 计算z（Equation 4）
-                z_prev = psi_x_prev - psi.forward(x_star.expand(batch_size,-1))[0]
-                z_next = psi_x_next - psi.forward(x_star.expand(batch_size,-1))[0]
-                
-                # 4.2 获取控制固定点u0（文档II.36节“辅助网络学习u0”，匹配批量大小）
-                u0_batch = psi.forward_u0(x_prev_batch)  # [B,2]
-                
-                # 4.3 更新A/B矩阵（文档Algorithm 1隐含步骤，调用matrix_utils）
-                A, B = update_A_B(z_prev, z_next, u_prev_batch, A, B)
-                
-                # 4.4 计算总损失（文档Algorithm 1步骤4：L(θ) = L1 + L2，加入u_prev和u0）
-                total_loss, L1, L2 = compute_total_loss(
-                    z_prev=z_prev,
-                    z_next=z_next,
-                    A=A,
-                    B=B,
-                    u_prev=u_prev_batch,
-                    u0=u0_batch,
-                    lambda_L1=1,
-                    lambda_L2=0.01  
-                )
-                total_loss += recon_loss * 0.01 + reg_loss * 0.01
-                # 4.5 反向传播与参数更新
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-                
-                total_epoch_loss += total_loss.item() * batch_size  # 累积 epoch 损失
-                L1_loss += L1.item() * batch_size
-                L2_loss += L2.item() * batch_size
-            # 每过20个epoch降低一次学习率
-            if (epoch + 1) % 20 == 0:
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] *= 0.5
-            # 打印epoch信息（平均损失，便于监控收敛）
-            avg_epoch_loss = total_epoch_loss / len(dataset)
-            L1 = L1_loss / len(dataset)
-            L2 = L2_loss / len(dataset)
-            avg_loss_list.append(avg_epoch_loss)
-            print(f"Epoch [{epoch+1:3d}/{epochs}] | 平均总损失：{avg_epoch_loss:.4f} | L1：{L1:.4f} | L2：{L2:.4f}", end='\r', flush=True)
-        plot_loss_curve(avg_loss_list, version)
-    # 5. 计算最终A/B/C矩阵（文档Algorithm 1步骤5，用全部数据确保收敛精度）
-    psi.eval()
-    with torch.no_grad():
-        # 5.1 计算全部数据的z（用于A/B/C计算）
-        z_prev_all = psi.compute_z(x_prev_tensor, x_star)  # [total,256]
-        z_next_all = psi.compute_z(x_next_tensor, x_star)  # [total,256]
-        # 5.2 最终A/B：用全部数据更新一次（避免批量偏差）
-        A_final, B_final = update_A_B(z_prev_all, z_next_all, u_prev_tensor, A, B)
-        # 5.3 最终C：文档Equation 9，输入z_prev（而非Ψ(x)），满足CΨ0=0约束
-        C_final = compute_C_matrix(x_prev_tensor, z_prev_all)  # [6,256]
+def calculate_parameter(psi, x_dim, z_dim, control_dim):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    A_lander = psi.A.weight
+    B_lander = psi.B.weight
+    I_n = torch.eye(x_dim, device=device)
+    zero_mat = torch.zeros(x_dim, z_dim, device=device)
+    C = torch.cat([I_n, zero_mat], dim=1)
+    Q = torch.eye(x_dim, device=device)
+    Q_ = C.T @ Q @ C
+    Q_ = 0.5 * (Q_ + Q_.T)
+    R_ = 0.1 * torch.eye(control_dim, device=device)
 
-    print(f"\nPsiMLP训练完成 | A_final.shape: {A_final.shape} | B_final.shape: {B_final.shape} | C_final.shape: {C_final.shape}")
-    return psi, A_final, B_final, C_final
+    Q_ = Q_.cpu().detach().numpy()
+    R_ = R_.cpu().detach().numpy()
+    return A_lander, B_lander, Q_, R_
 
-def plot_loss_curve(loss_list: List[float], version: str) -> None:
-    """
-    绘制训练损失曲线（便于监控训练过程）
-    
-    Args:
-        loss_list: 每个epoch的平均损失列表
-        version: PsiMLP版本标识（用于保存文件命名）
-    """
+def plot_stage1_losses(loss_list: List[float], version: str) -> None:
+    """绘制阶段1的K-step损失曲线（仅1条曲线，聚焦预训练收敛情况）"""
     plt.figure(figsize=(10, 6))
-    plt.plot(loss_list, label='Average Loss per Epoch')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Curve')
-    plt.yscale('log')  # 对数刻度便于观察收敛趋势
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(f'./fig/training_loss_curve_{version}.png')
+    plt.plot(range(1, len(loss_list)+1), loss_list, color="#2E86AB", linewidth=2, label="K-step Loss")
+    
+    # 图表美化与标注
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Loss", fontsize=12)
+    plt.title(f"Stage 1: K-step Loss Curve (Version: {version})", fontsize=14, pad=20)
+    plt.yscale("log")  # 对数刻度：清晰展示损失下降趋势（尤其前期快速下降阶段）
+    plt.grid(True, alpha=0.3, linestyle="--")
+    plt.legend(fontsize=10)
+    
+    # 保存图片（确保目录存在，避免报错）
+    os.makedirs("./fig", exist_ok=True)  # 若./fig不存在则创建
+    plt.savefig(f"./fig/stage1_kstep_loss_{version}.png", dpi=300, bbox_inches="tight")
+    plt.close()  # 关闭画布，释放内存
 
 
-def design_q_matrix(psi: PsiMLP, x_star: torch.Tensor, pos_weight: float = 100.0, other_weight: float = 1.0) -> np.ndarray:
-    """
-    为复杂网络设计Q矩阵：通过Psi网络找到x/y对应的Z分量，放大其权重
-    """
-    device = next(psi.parameters()).device
-    N = psi.output_dim  # Z维度（如256）
-    Q = np.eye(N) * other_weight  # 基础权重
-
-    # 1. 找到x/y变化敏感的Z分量（通过梯度计算：dΨ/dx、dΨ/dy）
-    x_sample = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=torch.float32).unsqueeze(0)  # x偏移样本
-    y_sample = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0, 0.0], device=device, dtype=torch.float32).unsqueeze(0)  # y偏移样本
-    x1_sample = torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], device=device, dtype=torch.float32).unsqueeze(0)  # x/y偏移样本
-    y1_sample = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], device=device, dtype=torch.float32).unsqueeze(0)  # θ偏移样本
-    x_star_tensor = x_star.unsqueeze(0)
-
-    # 2. 计算Ψ对x/y的梯度（敏感Z分量梯度大）
-    x_sample.requires_grad_(True)
-    z_x = psi.compute_z(x_sample, x_star_tensor)
-    z_x.sum().backward()
-    x_sensitivity = x_sample.grad.squeeze().cpu().numpy()  # 对x的敏感Z分量
-
-    y_sample.requires_grad_(True)
-    z_y = psi.compute_z(y_sample, x_star_tensor)
-    z_y.sum().backward()
-    y_sensitivity = y_sample.grad.squeeze().cpu().numpy()  # 对y的敏感Z分量
-
-    x1_sample.requires_grad_(True)
-    z_x1 = psi.compute_z(x1_sample, x_star_tensor)
-    z_x1.sum().backward()
-    xy_sensitivity = x1_sample.grad.squeeze().cpu().numpy()  # 对x/y的敏感Z分量
-
-    y1_sample.requires_grad_(True)
-    z_theta = psi.compute_z(y1_sample, x_star_tensor)
-    z_theta.sum().backward()
-    theta_sensitivity = y1_sample.grad.squeeze().cpu().numpy()  # 对θ的敏感Z分量
-
-    # 3. 放大敏感Z分量的权重
-    sensitive_indices = np.where((abs(x_sensitivity) > 0) | (abs(y_sensitivity) > 0)| (abs(xy_sensitivity) > 0)| (abs(theta_sensitivity) > 0))[0]  # 阈值可调整
-    Q[sensitive_indices, sensitive_indices] = pos_weight  # 位置相关Z分量权重=10
-    print(f"Q矩阵设计完成：{len(sensitive_indices)}/{N}个Z分量为位置敏感维度，权重={pos_weight}")
-    return Q
+def plot_stage2_losses(
+    total_losses: List[float],
+    k_losses: List[float],
+    emb_losses: List[float],
+    ctrl_losses: List[float],
+    inv_losses: List[float],
+    version: str
+) -> None:
+    """绘制阶段2的所有损失对比曲线（总损失+4个子损失，便于分析各约束效果）"""
+    plt.figure(figsize=(12, 8))
+    epochs = range(1, len(total_losses)+1)
+    
+    # 绘制各损失曲线（颜色/线型区分，便于识别）
+    plt.plot(epochs, total_losses, color="#A23B72", linewidth=3, label="Total Loss", zorder=5)  # 总损失置顶
+    plt.plot(epochs, k_losses, color="#F18F01", linestyle="--", linewidth=2, label="K-step Loss")
+    plt.plot(epochs, emb_losses, color="#C73E1D", linestyle="-.", linewidth=2, label="Embedding Loss")
+    plt.plot(epochs, ctrl_losses, color="#2E86AB", linestyle=":", linewidth=2, label="Control Loss")
+    plt.plot(epochs, inv_losses, color="#6A994E", linestyle="--", linewidth=2, label="Inverse Loss")
+    
+    # 图表美化与标注
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Loss", fontsize=12)
+    plt.title(f"Stage 2: Loss Curves Comparison (Version: {version})", fontsize=14, pad=20)
+    plt.yscale("log")  # 对数刻度：避免某类损失过大掩盖其他损失的变化
+    plt.grid(True, alpha=0.3, linestyle="--")
+    plt.legend(fontsize=10, loc="upper right")  # 图例放右上角，避免遮挡曲线
+    
+    # 保存图片（确保目录存在）
+    os.makedirs("./fig", exist_ok=True)
+    plt.savefig(f"./fig/stage2_all_losses_{version}.png", dpi=300, bbox_inches="tight")
+    plt.close()
 
 if __name__ == "__main__":  
     parse = argparse.ArgumentParser()
-    parse.add_argument('--test_version', type=str, default='v3', help='PsiMLP版本（v1或v2）')
+    parse.add_argument('--test_version', type=str, default='MCDKN', help='PsiMLP版本（v1或v2）')
     parse.add_argument('--controller_type', type=str, default='lqr', help='控制器类型（lqr或mpc）')
     parse.add_argument('--seed', type=int, default=50, help='随机种子')
-    parse.add_argument('--lr', type=float, default=1e-4, help='学习率')
-    parse.add_argument('--epochs', type=int, default=50, help='训练轮次')
-    parse.add_argument('--data_epochs', type=int, default=20, help='数据轮次')
+    parse.add_argument('--lr', type=float, default=1e-3, help='学习率')
+    parse.add_argument('--epochs_stage1', type=int, default=100, help='一阶段训练轮次')
+    parse.add_argument('--epochs_stage2', type=int, default=500, help='二阶段训练轮次')
+    parse.add_argument('--data_epochs', type=int, default=50, help='数据轮次')
     parse.add_argument('--batch_size', type=int, default=256, help='批量大小')
     parse.add_argument('--num_episodes', type=int, default=100, help='测试回合数')
     parse.add_argument('--data_prepared', action='store_true', help='是否使用预生成数据')
     parse.add_argument('--z_dim', type=int, default=12, help='高维状态维度N')
+    parse.add_argument('--x_dim', type=int, default=6, help='状态维度')
+    parse.add_argument('--control_dim', type=int, default=2, help='控制维度')
+    parse.add_argument('--neighbors', type=int, default=10, help='邻居数')
+    parse.add_argument('--K_steps', type=int, default=15, help='时域长度')
     # 选择测试版本（"v1"为基础版，"v2"为改进版） seed history:2\33\444\22\\789\666
     # test_version = "v1"
     args = parse.parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # 完整DKRC流程（文档IV.D节实验步骤：数据生成→网络训练→控制测试）
     # 步骤1：生成数据（文档IV.D节：5次游戏→1876组数据，Ornstein-Uhlenbeck噪声）
     print("="*50 + " 步骤1/3：生成月球着陆器数据 " + "="*50)
     if args.data_prepared:
         # 如果数据已准备好，直接加载（避免重复生成）
-        data = np.load(f"./data/lunar_lander_data_seed{args.seed}_episodes{args.data_epochs}.npz")
-        x_prev = data['x_prev']
-        u_prev = data['u_prev']
-        x_next = data['x_next']
+        data = np.load(f"./data/lunar_lander_ksteps_seed{args.seed}_ep{args.data_epochs}_K{args.K_steps}.npz")
+        x_prev = data['x_seq']
+        u_prev = data['u_seq']
+        x_next = data['x_next_seq']
         print(f"已加载预生成数据：{x_prev.shape[0]}组数据")
     else:
-        x_prev, u_prev, x_next = generate_lunar_lander_data(
+        x_prev, u_prev, x_next = generate_lunar_lander_data_ksteps(
             num_episodes=args.data_epochs,  # 文档指定5次，对应1876组数据
             noise_scale=0.1,  # 文档IV.D节指定噪声强度
-            seed=args.seed
+            K_steps=args.K_steps,
+            seed=args.seed,
+            window_step=1
         )
 
     print("\n" + "="*50 + " 步骤2/3：训练PsiMLP网络 " + "="*50)
-      
+    x_prev = torch.tensor(x_prev, dtype=torch.float32, device=device)
+    u_prev = torch.tensor(u_prev, dtype=torch.float32, device=device)
     # 步骤2：训练PsiMLP网络（文档II.28节+Algorithm 1）
-    psi_lander, A_lander, B_lander, C_lander = train_psi_lander(
-        x_prev=x_prev,
-        u_prev=u_prev,
-        x_next=x_next,
-        z_dim=args.z_dim if hasattr(args, 'z_dim') else 256,
-        epochs=args.epochs,  # 足够轮次确保收敛
+    psi_lander = train_mc_dkn(
+        X_train=x_prev,
+        U_train=u_prev,
         batch_size=args.batch_size,
+        epochs_stage1=args.epochs_stage1,
+        epochs_stage2=args.epochs_stage2,
         lr=args.lr,
-        version=args.test_version
+        neighbors=args.neighbors
     )
     # 保存A/B/C矩阵（便于后续分析）
-    np.savez(f"./data/lunar_lander_ABC_{args.test_version}_seed{args.seed}.npz", A=A_lander.cpu().numpy(), B=B_lander.cpu().numpy(), C=C_lander.cpu().numpy())
+    # np.savez(f"./data/lunar_lander_ABC_{args.test_version}_seed{args.seed}.npz", A=A_lander.cpu().numpy(), B=B_lander.cpu().numpy(), C=C_lander.cpu().numpy())
     # 步骤3：LQR控制测试（文档III节+IV.D节，用训练后的A/B计算LQR增益）
     print("\n" + "="*50 + " 步骤3/3：LQR控制测试 " + "="*50)
     # 目标状态x*：文档IV.D节定义（x=0, y=0，其余为0）
     x_star_lander = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], device=next(psi_lander.parameters()).device)
-    # 求解LQR增益（文档III节离散黎卡提方程）
-    if args.test_version == "v1":
-        if args.controller_type == "lqr":
-            K_lqr = solve_discrete_lqr(A_lander, B_lander)
-        elif args.controller_type == "mpc":
-            mpc_controller = DKRCMPCController(A=A_lander, B=B_lander, C=C_lander, psi_net=psi_lander, Q=np.diag([10]*6), R=0.1*np.eye(2), pred_horizon=10, x_star=x_star_lander, u0=psi_lander.u0.detach().cpu().numpy())
-    elif args.test_version == "v2" or args.test_version == "v3":
-        if args.controller_type == "lqr":
-            Q_complex = design_q_matrix(psi_lander, x_star_lander, pos_weight=1000.0, other_weight=1.0)
-            K_lqr = solve_discrete_lqr_v2(A_lander, B_lander, Q=Q_complex)
-        elif args.controller_type == "mpc":
-            mpc_controller = DKRCMPCController(A=A_lander, B=B_lander, C=C_lander, psi_net=psi_lander, Q=np.diag([10]*3 + [1]*3), R=0.1*np.eye(2), pred_horizon=10, x_star=x_star_lander, u0=psi_lander.u0.detach().cpu().numpy())
-        # low_dim = 64
-        # high_dim = 256 - low_dim
-        # K_lqr = solve_discrete_lqr(A_lander, B_lander, Q=np.diag([10] * low_dim + [1] * high_dim), R=0.1*np.eye(2))
-    # 测试控制效果（文档IV.D节10次测试）
-    if args.controller_type == "lqr":
-        test_lander_lqr(psi_lander, K_lqr, x_star_lander, num_episodes=args.num_episodes, version=args.test_version, seed=args.seed)
-    elif args.controller_type == "mpc":
-        test_lander_mpc(psi_lander, mpc_controller, x_star_lander, num_episodes=args.num_episodes, version=args.test_version, seed=args.seed)
+    A_lander, B_lander, Q_, R_ = calculate_parameter(psi_lander, args.x_dim, args.z_dim, args.control_dim)
+    K_lqr = solve_discrete_lqr(A_lander, B_lander)
+    test_lander_lqr(psi_lander, K_lqr, x_star_lander, num_episodes=args.num_episodes, version=args.test_version, seed=args.seed)
