@@ -41,7 +41,9 @@ class StateEmbedding(nn.Module):
         result = self.Linear1(x)
         result = self.activation(result)
         result = self.Linear2(result)
-        if len(x.shape) > 2:
+        if len(x.shape) > 3:
+            result = torch.cat([x, result], dim=3)
+        elif len(x.shape) > 2:
             result = torch.cat([x, result], dim=2)
         elif len(x.shape) > 1:
             result = torch.cat([x, result], dim=1)
@@ -244,14 +246,15 @@ class KStepsPredictor(nn.Module):
         z_pred_series = []  # 存储每步预测的原始状态，最终输出
         u_decode_series = []
         # 1. 初始状态嵌入：按🔶1-47节Equation 9，z = [原始状态x; 网络编码特征]
-        z_prev = self.StateEmbedding(x_init)  
+        z_prev = self.StateEmbedding(x_init)[:, 0, :]
         # 2. 递推执行K步预测（遵循🔶1-55节Equation 13的线性动力学）
+        u_series = u_series.permute(1, 0, 2) 
         for step in range(self.K_steps):
             # 2.1 从当前嵌入向量z_prev提取原始状态x_prev（🔶1-48节Equation 10：x = C·z，C=[I_n, 0]）
             # 注：StateEmbedding输出的z前x_dim维为原始状态，需依赖其x_dim属性记录原始状态维度
-            x_prev = z_prev[:, :self.StateEmbedding.x_dim]  
+            x_prev = z_prev[:, :self.StateEmbedding.x_dim]
             # 2.2 获取当前步的控制输入u_step（从K步控制序列中截取对应时间步）
-            u_step = u_series[:, step, :]  # 维度：B × control_dim
+            u_step = u_series[step, :, :]  # 维度：B × control_dim
             # 2.3 计算控制嵌入g_u(x_prev, u_step)（🔶1-51节DKAC逻辑，建模状态依赖的非线性控制项）
             g_u_step, u_step_decode, _ = self.ControlEmbedding(self.normalize_x(x_prev), u_step)  # 维度：B × control_dim
             # 2.4 用Koopman算子预测下一步嵌入向量z_next（🔶1-55节线性动力学：z_{t+1}=A·z_t + B·g_u）

@@ -114,8 +114,8 @@ def test_lander_lqr(
     plt.ylabel("Y Position", fontsize=12)
     plt.title(f"Lunar Lander Trajectory ({version})", fontsize=14)
     plt.legend(loc="upper right", bbox_to_anchor=(1.3, 1), fontsize=10)
-    os.makedirs("./fig", exist_ok=True)
-    plt.savefig(f"./fig/trajectory_{version}.png", bbox_inches="tight", dpi=300)
+    os.makedirs("./fig/lunarlander", exist_ok=True)
+    plt.savefig(f"./fig/lunarlander/trajectory_{version}.png", bbox_inches="tight", dpi=300)
     plt.close()
 
     avg_score = np.mean(episode_scores)
@@ -345,8 +345,8 @@ def plot_stage1_losses(loss_list: List[float], version: str) -> None:
     plt.yscale("log")
     plt.grid(True, alpha=0.3)
     plt.legend()
-    os.makedirs("./fig", exist_ok=True)
-    plt.savefig(f"./fig/stage1_loss_{version}.png", dpi=300, bbox_inches="tight")
+    os.makedirs("./fig/lunarlander", exist_ok=True)
+    plt.savefig(f"./fig/lunarlander/stage1_loss_{version}.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -370,8 +370,8 @@ def plot_stage2_losses(
     plt.yscale("log")
     plt.grid(True, alpha=0.3)
     plt.legend(loc="upper right")
-    os.makedirs("./fig", exist_ok=True)
-    plt.savefig(f"./fig/stage2_loss_{version}.png", dpi=300, bbox_inches="tight")
+    os.makedirs("./fig/lunarlander", exist_ok=True)
+    plt.savefig(f"./fig/lunarlander/stage2_loss_{version}.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -513,8 +513,8 @@ def plot_prediction_errors(
     plt.legend(fontsize=10)
 
     # 保存图片
-    os.makedirs("./fig", exist_ok=True)
-    plot_path = os.path.join("./fig", f"dkn_mc2_pred_errors_K{K_steps}.png")
+    os.makedirs("./fig/lunarlander", exist_ok=True)
+    plot_path = os.path.join("./fig/lunarlander", f"dkn_mc2_pred_errors_K{K_steps}.png")
     plt.tight_layout()
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()

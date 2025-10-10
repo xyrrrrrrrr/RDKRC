@@ -111,8 +111,8 @@ def test_krbf_lander_lqr(
     plt.grid(True, alpha=0.5)
 
     # 保存图片
-    os.makedirs("./fig", exist_ok=True)
-    plt.savefig(f"./fig/krbf_lander_trajectory_{version}.png", bbox_inches="tight", dpi=300)
+    os.makedirs("./fig/lunarlander", exist_ok=True)
+    plt.savefig(f"./fig/lunarlander/krbf_lander_trajectory_{version}.png", bbox_inches="tight", dpi=300)
     plt.close()
 
     # -------------------------- 测试总结 --------------------------
@@ -214,7 +214,7 @@ def evaluate_trajectory_prediction(
     
     # 保存结果
     if save_results:
-        result_file = os.path.join(result_path, f"trajectory_prediction_results_K{K_steps}.npz")
+        result_file = os.path.join(result_path, f"krbf_pred_results_K{K_steps}.npz")
         np.savez_compressed(
             result_file,
             mean_errors=mean_errors,
@@ -243,7 +243,7 @@ def evaluate_trajectory_prediction(
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    error_plot_path = os.path.join("./fig", f"prediction_errors_K{K_steps}.png")
+    error_plot_path = os.path.join("./fig/lunarlander", f"prediction_errors_K{K_steps}.png")
     plt.savefig(error_plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"[轨迹预测评估] 误差曲线图保存至：{error_plot_path}")
