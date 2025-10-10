@@ -85,234 +85,120 @@ def generate_lunar_lander_data(
 
 
 
-def generate_lunar_lander_data_ksteps(
-    num_episodes: int = 10,
-    noise_scale: float = 0.1,
-    env_name: str = "LunarLanderContinuous-v2",
-    seed: int = 2,
-    K_steps: int=15
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    生成论文IV.D节月球着陆器训练数据：随机策略+Ornstein-Uhlenbeck噪声
-    仅用于当前月球着陆器实验，不支持其他环境。
-    
-    Args:
-        num_episodes: 生成数据的游戏次数（论文指定5次，对应1876组数据）
-        noise_scale: Ornstein-Uhlenbeck噪声强度（论文IV.D节用0.1）
-        env_name: 环境名（固定为月球着陆器环境，不修改）
-        seed: 随机种子，确保结果可复现（默认2，论文未指定）
-    
-    Returns:
-        x_prev: 原始状态序列，shape=[total_samples, 6]（6维：x,y,θ,ẋ,ẏ,θ_dot）
-        u_prev: 控制输入序列，shape=[total_samples, 2]（2维：u₁主引擎, u₂侧引擎）
-        x_next: 下一状态序列，shape=[total_samples, 6]
-    """
-    env = gym.make(env_name)
-    env.seed(seed)
-    x_prev_list: list[np.ndarray] = []
-    u_prev_list: list[np.ndarray] = []
-    x_next_list: list[np.ndarray] = []
-
-    # 论文指定的Ornstein-Uhlenbeck噪声（用于数据探索）
-    def _ou_noise(prev_noise: np.ndarray) -> np.ndarray:
-        theta = 0.15  # 噪声衰减系数（论文默认值）
-        return theta * (-prev_noise) + noise_scale * np.random.randn(*prev_noise.shape)
-
-    for _ in range(num_episodes):
-        x_prev = env.reset()
-        prev_noise = np.zeros(env.action_space.shape[0])
-        done = False
-        while not done:
-            # 生成带噪声的随机控制（论文：未训练RL策略）
-            u_prev = env.action_space.sample() + _ou_noise(prev_noise)
-            u_prev = np.clip(u_prev, env.action_space.low, env.action_space.high)
-            prev_noise = _ou_noise(prev_noise)
-
-            # 交互获取下一状态
-            x_next, _, done, _ = env.step(u_prev)
-
-            # 存储数据（严格匹配论文6维状态、2维控制）
-            x_prev_list.append(x_prev[0:6])  # 取前6维状态（忽略第7、8维）
-            u_prev_list.append(u_prev)
-            x_next_list.append(x_next[0:6])  # 取前6维状态（忽略第7、8维）
-
-            x_prev = x_next
-
-    env.close()
-    # 转换为numpy数组（类型锁定为float32，适配PyTorch）
-    x_prev = np.array(x_prev_list, dtype=np.float32)
-    u_prev = np.array(u_prev_list, dtype=np.float32)
-    x_next = np.array(x_next_list, dtype=np.float32)
-    # 保存至/data/lunar_lander_data_seed{seed}_episodes{num_episodes}.npz
-    # 检查是否有data目录，没有则创建
-    if not os.path.exists("./data"):
-        os.makedirs("./data")
-    np.savez_compressed(
-        f"./data/lunar_lander_data_seed{seed}_episodes{num_episodes}.npz",
-        x_prev=x_prev,
-        u_prev=u_prev,
-        x_next=x_next
-    )
-    print(f"数据生成完成：{x_prev.shape[0]}组数据（论文目标1876组）")
-    return x_prev, u_prev, x_next
+def _ou_noise(prev_noise: np.ndarray, theta: float = 0.15, sigma: float = 0.1) -> np.ndarray:
+    """Ornstein-Uhlenbeck噪声（KRBF.pdf 8.1节随机探索策略）"""
+    return theta * (-prev_noise) + sigma * np.random.randn(*prev_noise.shape)
 
 
 def generate_lunar_lander_data_ksteps(
-    num_episodes: int = 10,
-    noise_scale: float = 0.1,
+    num_episodes: int = 50,
+    noise_scale: float = 0.5,
     env_name: str = "LunarLanderContinuous-v2",
     seed: int = 2,
     K_steps: int = 15,
-    window_step: int = 15  # 滑动窗口步长：默认=K_steps（无重叠），设1为全重叠
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    window_step: int = 1,
+    save_dir: str = "./data"
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    生成论文IV.D节月球着陆器K步训练数据：随机策略+Ornstein-Uhlenbeck噪声
-    新增K步连续序列提取，输出格式适配论文K-steps损失训练（Eq.14）
-    
-    Args:
-        num_episodes: 生成数据的游戏次数（论文指定5次≈1876组单步数据，10次≈3700组）
-        noise_scale: Ornstein-Uhlenbeck噪声强度（论文IV.D节用0.1，确保探索性）
-        env_name: 环境名（固定为月球着陆器，不支持修改）
-        seed: 随机种子（确保数据可复现，默认2）
-        K_steps: 目标连续序列长度（论文IV.B节指定15步，用于K-steps损失）
-        window_step: 滑动窗口步长（提取K步序列时的步长，默认=K_steps无重叠，设1为全重叠）
-    
+    生成月球着陆器K步数据+单步数据（适配KRBF单步EDMD输入）
     Returns:
-        x_seq: K步状态序列，shape=[total_k_samples, K_steps, 6] 
-               （6维状态：x,y,θ,ẋ,ẏ,θ_dot，对应论文IV.D节定义）
-        u_seq: K步控制序列，shape=[total_k_samples, K_steps, 2]
-               （2维控制：u₁主引擎推力，u₂侧引擎推力）
-        x_next_seq: K步下一状态序列，shape=[total_k_samples, K_steps, 6]
-                   （x_next_seq[i,t] = F(x_seq[i,t], u_seq[i,t])，对应论文时序关系）
+        x_seq: K步状态序列 [total_k, K_steps, 6]（原格式）
+        u_seq: K步控制序列 [total_k, K_steps, 2]（原格式）
+        x_next_seq: K步下一状态序列 [total_k, K_steps, 6]（原格式）
+        X_single: 单步状态 [n, K_total]（KRBF输入：n=6，K_total=总单步样本数）
+        U_single: 单步控制 [m, K_total]（KRBF输入：m=2）
+        Y_single: 单步下一状态 [n, K_total]（KRBF输入）
     """
-    # 1. 初始化环境与随机种子（确保可复现）
+    # 初始化环境
     env = gym.make(env_name)
     env.seed(seed)
     np.random.seed(seed)
-    
-    # 存储每个episode的完整时序数据（单步）
-    all_episode_x: list[np.ndarray] = []  # 每个元素：[episode_len, 6]（单episode的所有状态）
-    all_episode_u: list[np.ndarray] = []  # 每个元素：[episode_len, 2]（单episode的所有控制）
-    all_episode_x_next: list[np.ndarray] = []  # 每个元素：[episode_len, 6]（单episode的所有下一状态）
+    os.makedirs(save_dir, exist_ok=True)
 
-    # 2. 论文指定的Ornstein-Uhlenbeck噪声（用于随机探索，避免数据分布过窄）
-    def _ou_noise(prev_noise: np.ndarray) -> np.ndarray:
-        theta = 0.15  # 噪声衰减系数（论文默认值，平衡探索稳定性）
-        sigma = noise_scale  # 噪声强度（用户可调整，默认0.1）
-        return theta * (-prev_noise) + sigma * np.random.randn(*prev_noise.shape)
+    # 存储单episode时序数据
+    all_ep_x = []  # 每个元素：[ep_len, 6]
+    all_ep_u = []  # 每个元素：[ep_len, 2]
+    all_ep_x_next = []  # 每个元素：[ep_len, 6]
 
-    # 3. 生成每个episode的单步时序数据
-    print(f"开始生成{num_episodes}个episode的单步数据（K_steps={K_steps}）...")
+    # 1. 生成单episode单步数据
+    print(f"[Data Gen] 生成{num_episodes}个episode的单步数据...")
     for ep in range(num_episodes):
-        x_prev = env.reset()  # 初始状态（原环境输出8维，后续取前6维）
-        prev_noise = np.zeros(env.action_space.shape[0])  # 噪声初始值（2维，对应两个引擎）
+        x_prev = env.reset()[:6]  # 取前6维状态（x,y,θ,ẋ,ẏ,θ̇）
+        prev_noise = np.zeros(2)  # 2维控制噪声
+        ep_x, ep_u, ep_x_next = [], [], []
         done = False
-        
-        # 存储当前episode的单步数据
-        ep_x = []
-        ep_u = []
-        ep_x_next = []
-        
+
         while not done:
-            # 3.1 生成带OU噪声的随机控制（论文IV.D节：未训练RL策略，纯随机探索）
-            u_rand = env.action_space.sample()  # 基础随机控制（[-1,1]范围）
-            u_noise = _ou_noise(prev_noise)     # OU噪声（平滑随机波动）
-            u_prev = u_rand + u_noise
-            u_prev = np.clip(u_prev, env.action_space.low, env.action_space.high)  # 物理约束裁剪
-            prev_noise = u_noise  # 更新噪声状态（确保时序相关性）
+            # 生成带OU噪声的随机控制（KRBF.pdf 8.1节：随机输入探索）
+            u_rand = env.action_space.sample()
+            u_noise = _ou_noise(prev_noise, sigma=noise_scale)
+            u_prev = np.clip(u_rand + u_noise, env.action_space.low, env.action_space.high)
             
-            # 3.2 与环境交互，获取下一状态
+            # 环境交互
             x_next, _, done, _ = env.step(u_prev)
-            
-            # 3.3 存储单步数据（严格取前6维状态，符合论文IV.D节定义）
-            ep_x.append(x_prev[0:6])       # 当前状态：x,y,θ,ẋ,ẏ,θ_dot
-            ep_u.append(u_prev)            # 当前控制：u₁, u₂
-            ep_x_next.append(x_next[0:6])  # 下一状态：对应F(x_prev, u_prev)
-            
-            # 更新当前状态，进入下一步
+            x_next = x_next[:6]
+
+            # 存储单步数据
+            ep_x.append(x_prev)
+            ep_u.append(u_prev)
+            ep_x_next.append(x_next)
+
             x_prev = x_next
-        
-        # 3.4 保存当前episode的完整单步序列（转换为numpy数组）
-        ep_x = np.array(ep_x, dtype=np.float32)  # [episode_len, 6]
-        ep_u = np.array(ep_u, dtype=np.float32)  # [episode_len, 2]
-        ep_x_next = np.array(ep_x_next, dtype=np.float32)  # [episode_len, 6]
-        
-        all_episode_x.append(ep_x)
-        all_episode_u.append(ep_u)
-        all_episode_x_next.append(ep_x_next)
-        
-        print(f"Episode {ep+1:2d} | 单步数据长度：{len(ep_x)}（需≥{K_steps}才有效）")
+            prev_noise = u_noise
+
+        # 保存当前episode数据
+        all_ep_x.append(np.array(ep_x, dtype=np.float32))
+        all_ep_u.append(np.array(ep_u, dtype=np.float32))
+        all_ep_x_next.append(np.array(ep_x_next, dtype=np.float32))
+        print(f"[Data Gen] Episode {ep+1:2d} | 长度：{len(ep_x)}步")
 
     env.close()
-    print(f"\n单步数据生成完成：共{len(all_episode_x)}个episode，总单步数据量：{sum(len(ep) for ep in all_episode_x)}")
 
-    # 4. 核心新增：从单步数据中提取K步连续序列（滑动窗口法）
-    x_seq_list = []  # 存储所有K步状态序列
-    u_seq_list = []  # 存储所有K步控制序列
-    x_next_seq_list = []  # 存储所有K步下一状态序列
-
-    print(f"\n开始提取K步连续序列（窗口步长={window_step}）...")
-    for ep_idx in range(num_episodes):
-        # 获取当前episode的单步数据
-        ep_x = all_episode_x[ep_idx]          # [L, 6]，L为当前episode长度
-        ep_u = all_episode_u[ep_idx]          # [L, 2]
-        ep_x_next = all_episode_x_next[ep_idx]# [L, 6]
+    # 2. 提取K步序列数据（原格式，兼容扩展）
+    x_seq_list, u_seq_list, x_next_seq_list = [], [], []
+    print(f"\n[Data Gen] 提取K步序列（K={K_steps}，窗口步长={window_step}）...")
+    for ep_x, ep_u, ep_xn in zip(all_ep_x, all_ep_u, all_ep_x_next):
         L = len(ep_x)
-        
-        # 跳过长度不足K_steps的episode（无法提取有效K步序列）
         if L < K_steps:
-            print(f"警告：Episode {ep_idx+1}长度={L} < K_steps={K_steps}，跳过该episode")
+            print(f"[Data Gen] 跳过短episode（长度{l} < {K_steps}）")
             continue
-        
-        # 滑动窗口提取K步序列：起始索引范围[0, L-K_steps]，步长=window_step
-        max_start_idx = L - K_steps
-        for start_idx in range(0, max_start_idx + 1, window_step):
-            # 提取K步状态序列：x_seq[t] = 第start_idx+t步的状态（t=0~K_steps-1）
-            x_k = ep_x[start_idx : start_idx + K_steps]  # [K_steps, 6]
-            # 提取对应K步控制序列：u_seq[t] = 第start_idx+t步的控制
-            u_k = ep_u[start_idx : start_idx + K_steps]  # [K_steps, 2]
-            # 提取对应K步下一状态序列：x_next_seq[t] = F(x_k[t], u_k[t])
-            x_next_k = ep_x_next[start_idx : start_idx + K_steps]  # [K_steps, 6]
-            
-            # 保存到列表
-            x_seq_list.append(x_k)
-            u_seq_list.append(u_k)
-            x_next_seq_list.append(x_next_k)
+        # 滑动窗口提取K步序列
+        for s in range(0, L - K_steps + 1, window_step):
+            x_seq_list.append(ep_x[s:s+K_steps])
+            u_seq_list.append(ep_u[s:s+K_steps])
+            x_next_seq_list.append(ep_xn[s:s+K_steps])
 
-    # 5. 转换为最终numpy数组（适配论文K-steps训练输入格式）
-    x_seq = np.array(x_seq_list, dtype=np.float32)  # [total_k_samples, K_steps, 6]
-    u_seq = np.array(u_seq_list, dtype=np.float32)  # [total_k_samples, K_steps, 2]
-    x_next_seq = np.array(x_next_seq_list, dtype=np.float32)  # [total_k_samples, K_steps, 6]
+    x_seq = np.array(x_seq_list, dtype=np.float32)  # [total_k, K_steps, 6]
+    u_seq = np.array(u_seq_list, dtype=np.float32)  # [total_k, K_steps, 2]
+    x_next_seq = np.array(x_next_seq_list, dtype=np.float32)  # [total_k, K_steps, 6]
 
-    # 6. 数据校验与日志
-    total_k_samples = len(x_seq)
-    print(f"\nK步序列提取完成：")
-    print(f"- 有效K步样本数：{total_k_samples}（每个样本含{K_steps}步连续数据）")
-    print(f"- x_seq shape: {x_seq.shape}（K步状态序列）")
-    print(f"- u_seq shape: {u_seq.shape}（K步控制序列）")
-    print(f"- x_next_seq shape: {x_next_seq.shape}（K步下一状态序列）")
+    # 3. 展平为KRBF所需单步数据（n×K_total，m×K_total）
+    X_single = np.concatenate(all_ep_x, axis=0).T  # [6, K_total]
+    U_single = np.concatenate(all_ep_u, axis=0).T  # [2, K_total]
+    Y_single = np.concatenate(all_ep_x_next, axis=0).T  # [6, K_total]
 
-    # 7. 保存K步数据到本地（npz压缩格式，方便后续训练加载）
-    save_dir = "./data"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    save_path = f"{save_dir}/lunar_lander_ksteps_seed{seed}_ep{num_episodes}_K{K_steps}.npz"
-    
+    # 4. 保存数据
+    save_path = f"{save_dir}/lunar_lander_ksteps_seed{seed}_ep{num_episodes}.npz"
     np.savez_compressed(
         save_path,
-        x_seq=x_seq,          # K步状态序列
-        u_seq=u_seq,          # K步控制序列
-        x_next_seq=x_next_seq, # K步下一状态序列
-        K_steps=K_steps,      # 存储K_steps参数，方便加载时校验
-        seed=seed             # 存储随机种子，确保可复现
+        x_seq=x_seq, u_seq=u_seq, x_next_seq=x_next_seq,
+        X_single=X_single, U_single=U_single, Y_single=Y_single,
+        K_steps=K_steps, seed=seed
     )
-    print(f"\n数据已保存至：{save_path}")
+    print(f"\n[Data Gen] 数据保存至：{save_path}")
+    print(f"[Data Gen] 单步数据规模：X_single={X_single.shape}, U_single={U_single.shape}")
 
-    # 8. 额外返回单步数据统计（可选，方便用户核对）
-    total_single_samples = sum(len(ep) for ep in all_episode_x)
-    print(f"=== 数据生成总结 ===")
-    print(f"总单步数据量：{total_single_samples}组（原格式）")
-    print(f"总K步样本量：{total_k_samples}组（训练格式，K_steps={K_steps}）")
-    print(f"数据利用率：{total_k_samples * K_steps / total_single_samples * 100:.1f}%（窗口步长={window_step}）")
+    return x_seq, u_seq, x_next_seq, X_single, U_single, Y_single
 
-    return x_seq, u_seq, x_next_seq
+def load_lunar_lander_data(
+    load_path: str = "./data/lunar_lander_ksteps_seed2_ep50.npz"
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """加载预生成的月球着陆器数据（KRBF专用）"""
+    if not os.path.exists(load_path):
+        raise FileNotFoundError(f"数据文件不存在：{load_path}")
+    data = np.load(load_path)
+    print(f"[Data Load] 加载数据：{load_path}")
+    return (
+        data["x_seq"], data["u_seq"], data["x_next_seq"],
+        data["X_single"], data["U_single"], data["Y_single"]
+    )

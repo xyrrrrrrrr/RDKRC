@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from typing import Tuple
+from typing import Tuple, Optional
 from rdkrc.utils.matrix_utils import compute_controllability_matrix
 from rdkrc.utils.data_utils import compute_knn_neighbors
 
@@ -159,6 +159,7 @@ class ManifoldEmbLoss(nn.Module):
         super().__init__()
         self.k = k  # K近邻数量
         self.neighbor_indices = None  # 不再预存全局索引，改为batch内临时存储
+        self.GraphMatchingLoss = GraphMatchingLoss()
 
     def compute_knn(self, X):
         """针对单个batch的X，计算每个样本的K近邻索引（仅在当前batch内）"""
@@ -187,19 +188,75 @@ class ManifoldEmbLoss(nn.Module):
         x_neighbors = X[self.neighbor_indices]  # [n, k, x_dim]
         
         # 计算原状态与邻居的距离、嵌入后与邻居的距离
-        x_dist = torch.cdist(X.unsqueeze(1), x_neighbors, p=2).squeeze(1)  # [n, k]
-        z_dist = torch.cdist(z.unsqueeze(1), z_neighbors, p=2).squeeze(1)  # [n, k]
+        x_dist = torch.cdist(X.unsqueeze(1), x_neighbors, p=2).squeeze(1) 
+        z_dist = torch.cdist(z.unsqueeze(1), z_neighbors, p=2).squeeze(1) 
+
+        x_dist_max = torch.max(x_dist, dim=1, keepdim=True)[0]
+        x_dist_max = torch.clamp(x_dist_max, min=1e-8)  # 防止过小导致梯度爆炸
+        x_dist = x_dist / x_dist_max  # 归一化，避免尺度
+        z_dist_max = torch.max(z_dist, dim=1, keepdim=True)[0]
+        z_dist_max = torch.clamp(z_dist_max, min=1e-8)  # 防止过小导致梯度爆炸
+        z_dist = z_dist / z_dist_max  # 归一化，避免尺度
+
+        # # 计算dij, dzij
+        # dij = torch.cdist(x_neighbors, x_neighbors, p=2)  # [n, k, k]
+        # d_zij = torch.cdist(z_neighbors, z_neighbors, p=2)  # [n, k, k]
         
-        # 计算流形损失（原逻辑不变）
-        loss = torch.mean(torch.abs(z_dist - x_dist))
-        return loss
-    
+        # # 计算流形损失（原逻辑不变）
+        loss1 = torch.mean(torch.abs(z_dist - x_dist))
+        # loss2 = self.GraphMatchingLoss(dij, d_zij)
+        # return loss1 + loss2
+
+        return loss1
+
+class GraphMatchingLoss(nn.Module):
+    """
+    图匹配损失（PyTorch版）：对齐文档🔶2-59节图匹配损失公式
+    功能：计算原空间距离矩阵dij与潜空间距离矩阵d_zij的"距离差一致性"损失，
+          通过全局最大距离差归一化，避免尺度差异影响训练（文档隐含要求，🔶2-60节）
+    """
+    def __init__(self):
+        super().__init__()
+        # 继承ManifoldEmbLoss的简洁初始化风格，无额外超参（核心参数由forward传入）
+
+    def forward(
+        self, 
+        dij: torch.Tensor, 
+        d_zij: torch.Tensor, 
+    ) -> torch.Tensor:
+        """
+        Args:
+            dij: 原空间测地线距离矩阵（文档🔶2-33节d_D(xi,xj)），shape=[B, B]（B为样本数）
+            d_zij: 潜空间距离矩阵（文档🔶2-33节d_M(φ(xi),φ(xj))），shape=[B, B]
+            dij_diff_max: 原空间距离差的全局最大值（文档🔶2-59节归一化因子），标量；
+                          若为None，自动计算（适配无预计算场景）
+        
+        Returns:
+            gm_loss: 图匹配损失（标量），符合文档🔶2-59节公式定义
+        """
+
+        diff_dij_temp = dij.unsqueeze(1) - dij.unsqueeze(0)  # [B, B, B]
+        dij_diff_max = torch.max(torch.abs(diff_dij_temp))  # 标量
+        
+        # 2. 数值稳定性处理（参考ManifoldEmbLoss的1e-8策略，避免除以零）
+        dij_diff_max = torch.clamp(dij_diff_max, min=1e-8)  # 防止dij_diff_max过小导致梯度爆炸
+        
+        # 3. 计算距离差（对齐JAX原逻辑：dij[:,newaxis]-dij[newaxis]）
+        # 文档依据：🔶2-55节图匹配损失需计算"每个样本对(i,j)相对于所有k的距离差"
+        diff_dij = dij.unsqueeze(1) - dij.unsqueeze(0)  # [B, B, B]：diff_dij[i,j,k] = dij[i,k] - dij[j,k]
+        diff_d_z_ij = d_zij.unsqueeze(1) - d_zij.unsqueeze(0)  # [B, B, B]：潜空间对应距离差
+        
+        # 4. 计算图匹配损失（文档🔶2-59节公式：归一化平方损失的均值）
+        gm_loss = torch.mean(((diff_dij - diff_d_z_ij) / dij_diff_max) ** 2)
+        
+        return gm_loss
+
 class ManifoldCtrlLoss(nn.Module):
     def __init__(self):
         super().__init__()
         self.mse_loss = nn.MSELoss()
 
-    def forward(self, A: nn.Linear, B: nn.Linear, z_t: torch.Tensor, z_t1: torch.Tensor, g_phi: torch.Tensor) -> torch.Tensor:
+    def forward(self, A: nn.Linear, B: nn.Linear, z_t: torch.Tensor, z_t1: torch.Tensor, g_phi: torch.Tensor, u:torch.Tensor) -> torch.Tensor:
         """
         计算线性演化一致性损失
         A, B: Koopman算子（nn.Linear层，无偏置）
@@ -219,63 +276,60 @@ class ManifoldCtrlLoss(nn.Module):
         g_phi_theo = z_diff @ B_pinv.T
         
         # 一致性损失
-        return self.mse_loss(g_phi, g_phi_theo)
+        loss1 = self.mse_loss(g_phi * u, g_phi_theo)
 
-def compute_L_track(z_fused: torch.Tensor, z_ref: torch.Tensor) -> torch.Tensor:
-    """
-    z_fused: 模型输出的时序特征 [batch, T, 256]
-    z_ref: 参考轨迹的时序特征（由参考状态x_ref通过PsiMLP生成） [batch, T, 256]
-    返回：时序MSE损失（含帧间平滑项）
-    """
-    # 1. 帧内跟踪误差（每帧z与参考z的MSE）
-    frame_loss = torch.norm(z_fused - z_ref, p=2, dim=2).mean()  # [batch, T] → 标量
+        return loss1
     
-    # 2. 帧间平滑误差（避免相邻帧跳变，现实硬件需平滑控制）
-    smooth_loss = torch.norm(z_fused[:, 1:, :] - z_fused[:, :-1, :], p=2, dim=2).mean()
-    
-    # 总跟踪损失（平滑项权重0.5，平衡精度与平滑）
-    return frame_loss + 0.5 * smooth_loss
+class ManifoldCtrlInvLoss(nn.Module):
+    def __init__(self, k):
+        super().__init__()
+        self.k = k
+        self.mse_loss = nn.MSELoss()
 
-def compute_L_obstacle(x_seq: torch.Tensor, obs: torch.Tensor, safe_dist=0.5) -> torch.Tensor:
-    """
-    x_seq: 时序状态 [batch, T, input_dim]（input_dim含x/y坐标，如2D场景取前2维）
-    obs: 障碍物信息 [batch, 4]（x_min,y_min,x_max,y_max）
-    safe_dist: 安全距离（如0.5m，根据现实硬件尺寸设定）
-    返回：障碍规避损失（仅当距离<安全阈值时惩罚）
-    """
-    batch_size, T, _ = x_seq.shape
-    # 提取状态的x/y坐标（假设前2维为位置）
-    x_pos = x_seq[..., 0].unsqueeze(2)  # [batch, T, 1]
-    y_pos = x_seq[..., 1].unsqueeze(2)  # [batch, T, 1]
-    
-    # 计算到障碍物的最小距离（2D轴对齐障碍框）
-    # 障碍左边界距离：x_pos - obs[...,0]（x_pos > obs左边界时为正）
-    dist_left = x_pos - obs[:, 0].unsqueeze(1).unsqueeze(2).expand(-1, T, -1)  # [batch, T, 1]
-    dist_right = obs[:, 2].unsqueeze(1).unsqueeze(2).expand(-1, T, -1) - x_pos  # [batch, T, 1]
-    dist_bottom = y_pos - obs[:, 1].unsqueeze(1).unsqueeze(2).expand(-1, T, -1)  # [batch, T, 1]
-    dist_top = obs[:, 3].unsqueeze(1).unsqueeze(2).expand(-1, T, -1) - y_pos     # [batch, T, 1]
-    
-    # 最小距离（仅取正距离，即状态在障碍外的距离）
-    min_dist = torch.min(torch.cat([dist_left, dist_right, dist_bottom, dist_top], dim=2), dim=2)[0]  # [batch, T]
-    
-    # 势场损失：距离越近，惩罚越大（Hinge损失变体）
-    obstacle_loss = torch.max(torch.tensor(0.0, device=x_seq.device), safe_dist - min_dist).mean()
-    return obstacle_loss
+    def compute_knn(self, X):
+        """针对单个batch的X，计算每个样本的K近邻索引（仅在当前batch内）"""
+        # 计算X的 pairwise 距离（欧氏距离）
+        n = X.shape[0]
+        dist_matrix = torch.cdist(X, X, p=2)  # shape=[n, n]
+        # 取每个样本的前k+1个近邻（排除自身，所以k+1），再去掉第0个（自身）
+        _, indices = torch.topk(dist_matrix, k=self.k+1, largest=False, dim=1)
+        self.neighbor_indices = indices[:, 1:]  # shape=[n, k]，每个样本的k个邻居索引
+        return self.neighbor_indices
 
-def compute_L_control(u: torch.Tensor, u_min: torch.Tensor, u_max: torch.Tensor) -> torch.Tensor:
-    """
-    u: 模型输出的控制输入 [batch, T, m]
-    u_min: 控制输入下限（如电机最小扭矩） [m]
-    u_max: 控制输入上限（如电机最大扭矩） [m]
-    返回：控制约束损失
-    """
-    # 扩展u_min/u_max到批量时序维度
-    u_min_expand = u_min.unsqueeze(0).unsqueeze(0).expand(u.shape[0], u.shape[1], -1)  # [batch, T, m]
-    u_max_expand = u_max.unsqueeze(0).unsqueeze(0).expand(u.shape[0], u.shape[1], -1)  # [batch, T, m]
-    
-    # 惩罚超出下限的部分：max(0, u_min - u)
-    loss_min = torch.max(torch.tensor(0.0, device=u.device), u_min_expand - u).mean()
-    # 惩罚超出上限的部分：max(0, u - u_max)
-    loss_max = torch.max(torch.tensor(0.0, device=u.device), u - u_max_expand).mean()
-    
-    return loss_min + loss_max
+    def forward(self, U_recover: torch.Tensor, U_real: torch.Tensor) -> torch.Tensor:
+        """
+        计算线性演化一致性损失
+        A, B: Koopman算子（nn.Linear层，无偏置）
+        z_t: t时刻嵌入向量 [batch, n+d]
+        z_t1: t+1时刻嵌入向量 [batch, n+d]
+        g_phi: 控制网络输出 [batch, m]（m为控制维度）
+        """
+        # 差距损失
+        loss1 = self.mse_loss(U_recover, U_real)
+
+        # return loss1
+         # 第一步：针对当前batch的X，动态计算K近邻索引
+        self.compute_knn(U_real)
+        # 第二步：根据邻居索引，提取z和X的邻居样本
+        n = U_real.shape[0]
+        # 确保索引在合法范围内（双重保险）
+        self.neighbor_indices = torch.clamp(self.neighbor_indices, 0, n-1)
+        
+        # 提取每个样本的邻居（shape=[n, k, dim]）
+        U_real_neighbors = U_real[self.neighbor_indices]  # [n, k, manifold_dim]
+        U_recover_neighbors = U_recover[self.neighbor_indices]  # [n, k, x_dim]
+        
+        # 计算原状态与邻居的距离、嵌入后与邻居的距离
+        U_real_dist = torch.cdist(U_real.unsqueeze(1), U_real_neighbors, p=2).squeeze(1) 
+        U_recover_dist = torch.cdist(U_recover.unsqueeze(1), U_recover_neighbors, p=2).squeeze(1) 
+
+        U_real_dist_max = torch.max(U_real_dist, dim=1, keepdim=True)[0] + 1e-8
+        U_real_dist = U_real_dist / U_real_dist_max  # 归一化，避免尺度
+        U_recover_dist_max = torch.max(U_recover_dist, dim=1, keepdim=True)[0] + 1e-8
+        U_recover_dist = U_recover_dist / U_recover_dist_max  # 归一化，避免尺度
+
+        # 计算流形损失（原逻辑不变）
+        loss2 = torch.mean(torch.abs(U_real_dist - U_recover_dist))
+
+
+        return loss1 + loss2
