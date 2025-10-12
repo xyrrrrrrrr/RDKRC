@@ -152,7 +152,9 @@ class DKN_MC2(nn.Module):
         # 2. Koopman算子（A: 流形内线性演化，B: 控制嵌入到流形）
         self.A = nn.Linear(manifold_dim, manifold_dim, bias=False)  # A: 流形维度→流形维度
         self.B = nn.Linear(control_manifold_dim, manifold_dim, bias=False)        # B: 控制维度→流形维度
-        
+        # 初始化
+        nn.init.kaiming_uniform_(self.A.weight, a=np.sqrt(5))
+        nn.init.kaiming_uniform_(self.B.weight, a=np.sqrt(5))
         # 3. 控制网络（原DKN + 逆映射分支）
         self.control_net = nn.Sequential(  # g_phi(x,u)
             nn.Linear(x_dim + u_dim, hidden_dim),

@@ -9,7 +9,7 @@ class KRBFModel:
     KRBF模型：基于Koopman算子与RBF的线性预测器（适配月球着陆器）
     对应`KRBF.pdf` 3.2节（EDMD）、4节（数值算法）、5节（MPC）
     """
-    def __init__(self, n: int = 6, m: int = 2, N_rbf: int = 100, Np: int = 50, state_low = [-2, -2, -5, -5, -math.pi, -5], state_high = [2, 2, 5, 5, math.pi, 5], action_low=[-1,0], action_high=[1,1]) -> None:
+    def __init__(self, n: int = 6, m: int = 2, N_rbf: int = 50, Np: int = 50, state_low = [-2, -2, -5, -5, -math.pi, -5], state_high = [2, 2, 5, 5, math.pi, 5], action_low=[-1,0], action_high=[1,1]) -> None:
         """
         Args:
             n: 状态维度（月球着陆器6维）
